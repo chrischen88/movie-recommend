@@ -310,7 +310,8 @@ def test_metrics(client: TestClient, sample_zip: bytes) -> None:
     assert m["ready"] and m["mode"] == "fixed" and m["n_ratings"] == 28  # < 50: fixed weights
     assert m["fixed_weights"] == {"profile": 0.3, "embedding": 0.4, "collab": 0.3}
     assert {"baseline_mean", "profile", "embedding", "fixed_blend", "learned_blend"} <= m["metrics"].keys()
-    assert all(v["rmse"] > 0 for v in m["metrics"].values())
+    assert all(v["rmse"] > 0 for k, v in m["metrics"].items() if k != "ranking")
+    assert m["metrics"]["ranking"]["rmse"] is None  # a ranking, not a rating prediction
     assert m["partial"]["features"] == ["profile", "embedding", "votes"]
     assert m["collab_model"] is None and m["omdb"]["enabled"] is False
     assert m["candidates"]["total"] > 0 and sum(m["candidates"]["by_source"].values()) > 0

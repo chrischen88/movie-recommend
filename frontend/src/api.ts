@@ -141,7 +141,8 @@ export interface RecFilters {
 }
 
 export interface MethodMetrics {
-  rmse: number;
+  /** null for "ranking", which orders films rather than predicting stars. */
+  rmse: number | null;
   spearman: number | null;
   n: number;
 }
@@ -162,6 +163,8 @@ export interface MetricsResponse {
   n_with_collab?: number;
   trained_at?: string;
   fixed_weights?: Record<string, number>;
+  /** Share of taste fit (①②) in the learned-mode ranking. */
+  rank_fit_weight?: number;
   full?: LinearBlend | null;
   partial?: LinearBlend | null;
   metrics?: Record<string, MethodMetrics>;

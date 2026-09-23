@@ -32,7 +32,7 @@ from app.collab import CollabScorer
 from app.config import Settings
 from app.db import Movie
 from app.profile import build_profile, score_profile
-from app.taste import build_taste_model, score_embeddings
+from app.taste import build_taste_model, percentile_rank, score_embeddings
 
 log = logging.getLogger(__name__)
 
@@ -123,6 +123,24 @@ class BlendModel:
         except (ValueError, TypeError, KeyError) as exc:
             log.error("could not read blend model %s: %s", path, exc)
             return None
+
+
+def taste_fit(profile: float | None, embedding: float) -> float:
+    """How much a film looks like your kind of film: the mean of ① and ②."""
+    return embedding if profile is None else (profile + embedding) / 2
+
+
+def rank_with_fit(predicted: np.ndarray, fit: np.ndarray, weight: float) -> np.ndarray:
+    """The ranking score, 0–1: percentile of (1−w)·pct(predicted) + w·pct(fit).
+
+    The learned blend predicts how you'd *rate* a film if you watched it, and on
+    real data puts nearly all its weight on ③, so ① and ② stop mattering and the
+    top fills with acclaimed films that aren't your kind of thing. Mixing taste
+    fit back in trades a little predicted rating for recommendations that match
+    what you choose to watch (PROGRESS.md, decision 23)."""
+    if weight <= 0 or len(predicted) == 0:
+        return percentile_rank(predicted)
+    return percentile_rank((1 - weight) * percentile_rank(predicted) + weight * percentile_rank(fit))
 
 
 def fixed_model(settings: Settings) -> BlendModel:
@@ -274,6 +292,10 @@ def fit_blend(rows: Sequence[OOFRow], settings: Settings) -> BlendModel:
         model.full, pred_full = _fit_ridge(x_full, y[has_c], full_feats, k, seed)
         blended[has_c] = pred_full
     metrics["learned_blend"] = {"rmse": _rmse(blended, y), "spearman": _spearman(blended, y), "n": len(rows)}
+    if settings.rank_fit_weight > 0:
+        fit = np.array([taste_fit(r.profile, r.embedding) for r in rows])
+        ranked = rank_with_fit(blended, fit, settings.rank_fit_weight)
+        metrics["ranking"] = {"rmse": None, "spearman": _spearman(ranked, y), "n": len(rows)}
     model.metrics = metrics
 
     if len(rows) >= settings.blend_min_ratings_for_learning:
@@ -296,7 +318,7 @@ def inputs_fingerprint(
                      settings.taste_cluster_min_size, settings.blend_cv_folds,
                      settings.blend_min_ratings_for_learning, list(settings.blend_fallback_weights),
                      settings.blend_use_vote_count, settings.collab_min_item_ratings,
-                     settings.collab_min_user_ratings, settings.collab_seed],
+                     settings.collab_min_user_ratings, settings.collab_seed, settings.rank_fit_weight],
         "extra": list(extra),
     }, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]

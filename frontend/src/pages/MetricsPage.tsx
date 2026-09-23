@@ -8,7 +8,8 @@ const METHODS: [string, string][] = [
   ["embedding", "② Embedding similarity alone"],
   ["collab", "③ Collaborative alone"],
   ["fixed_blend", "Fixed weights"],
-  ["learned_blend", "Learned blend"],
+  ["learned_blend", "Learned blend (predicted rating)"],
+  ["ranking", "Ranking you see"],
 ];
 
 const FEATURES: Record<string, string> = {
@@ -52,7 +53,7 @@ export default function MetricsPage() {
   }
 
   const metrics = data.metrics ?? {};
-  const bestRmse = Math.min(...Object.values(metrics).map((m) => m.rmse));
+  const bestRmse = Math.min(...Object.values(metrics).flatMap((m) => (m.rmse === null ? [] : [m.rmse])));
 
   return (
     <div className="space-y-8">
@@ -113,10 +114,19 @@ export default function MetricsPage() {
               {METHODS.filter(([k]) => metrics[k]).map(([key, label]) => {
                 const m = metrics[key];
                 return (
-                  <tr key={key} className={key === "learned_blend" ? "text-emerald-300" : "text-zinc-300"}>
-                    <td className="py-1.5">{label}</td>
+                  <tr key={key} className={key === "ranking" ? "text-emerald-300" : "text-zinc-300"}>
+                    <td className="py-1.5">
+                      {label}
+                      {key === "ranking" && data.rank_fit_weight !== undefined && (
+                        <span className="text-zinc-500">
+                          {" "}
+                          ({Math.round((1 - data.rank_fit_weight) * 100)}% predicted rating,{" "}
+                          {Math.round(data.rank_fit_weight * 100)}% taste fit ①②)
+                        </span>
+                      )}
+                    </td>
                     <td className={`py-1.5 text-right tabular-nums ${m.rmse === bestRmse ? "font-semibold" : ""}`}>
-                      {m.rmse.toFixed(3)}
+                      {m.rmse === null ? "—" : m.rmse.toFixed(3)}
                     </td>
                     <td className="py-1.5 text-right tabular-nums">
                       {m.spearman === null ? "—" : m.spearman.toFixed(3)}
@@ -130,7 +140,9 @@ export default function MetricsPage() {
           <p className="text-xs text-zinc-500">
             RMSE is in stars (lower is better). Rank correlation runs from −1 to 1 (higher is better). Single scores
             are mapped to stars with a linear fit, so their RMSE is comparable with the blends. ③ is measured only on
-            films that are in MovieLens.
+            films that are in MovieLens. The ranking mixes in taste fit on purpose: it gives up a little rank
+            correlation on films you've already chosen to watch so the list stays your kind of film instead of
+            everyone's favourite classics.
           </p>
         </Section>
       )}

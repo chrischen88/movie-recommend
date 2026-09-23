@@ -78,7 +78,7 @@ export default function RecommendationsPage() {
             : "Ranked by fixed weights on your taste profile ①, embedding similarity ②"}
           {recs.collab_films != null ? " and collaborative score ③" : ""}
           {recs.blend_mode === "learned"
-            ? ", weighted by how well each one predicted your own ratings"
+            ? ": your predicted rating (weighted by how well each score predicted your own ratings) mixed with how well it fits your taste (① and ②)"
             : ` (too few ratings to learn weights yet)`}
           {taste?.n_rated ? `. Built from ${taste.n_rated} rated films` : ""}
           {taste?.clusters.length ? ` in ${taste.clusters.length} taste clusters` : ""}.

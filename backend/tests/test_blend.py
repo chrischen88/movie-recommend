@@ -5,7 +5,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from app.blend import BlendModel, LinearBlend, OOFRow, fit_blend, fixed_model, out_of_fold
+from app.blend import (BlendModel, LinearBlend, OOFRow, fit_blend, fixed_model, out_of_fold, rank_with_fit,
+                       taste_fit)
 from app.config import Settings
 from app.db import Movie
 
@@ -69,6 +70,22 @@ def test_few_ratings_use_fixed_weights() -> None:
 def test_without_vote_feature() -> None:
     m = fit_blend(rows(80), settings(blend_use_vote_count=False))
     assert m.full is not None and "votes" not in m.full.features
+
+
+def test_rank_with_fit() -> None:
+    predicted = np.array([4.6, 4.5, 4.0, 3.5, 3.0])
+    fit = np.array([0.1, 0.95, 0.9, 0.3, 0.2])  # the top prediction isn't your kind of film
+    assert list(np.argsort(-rank_with_fit(predicted, fit, 0.0))) == [0, 1, 2, 3, 4]  # rating only
+    mixed = rank_with_fit(predicted, fit, 0.5)
+    assert np.argmax(mixed) == 1 and mixed[1] > mixed[0]  # good rating and good fit wins
+    assert mixed.min() == 0.0 and mixed.max() == 1.0  # still a percentile
+    assert taste_fit(None, 0.8) == 0.8 and taste_fit(0.4, 0.8) == pytest.approx(0.6)
+
+
+def test_ranking_metric() -> None:
+    m = fit_blend(rows(120), settings())
+    assert m.metrics["ranking"]["rmse"] is None and m.metrics["ranking"]["spearman"] is not None
+    assert "ranking" not in fit_blend(rows(120), settings(rank_fit_weight=0)).metrics
 
 
 def test_save_load(tmp_path: Path) -> None:

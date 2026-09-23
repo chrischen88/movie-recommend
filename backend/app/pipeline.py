@@ -601,6 +601,7 @@ class Pipeline:
             watchlist_boost=cfg.watchlist_boost,
             mmr_lambda=cfg.mmr_lambda if mmr else None,
             min_runtime=cfg.recommend_min_runtime,
+            fit_weight=cfg.rank_fit_weight,
         )
         return result, blend
 

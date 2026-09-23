@@ -18,7 +18,7 @@ _Last updated: 2026-09-23_
 | 7 | OpenAI layer: re-rank, explanations, natural-language requests | ⏭ Next |
 | 8 | UI polish, taste profile page, feedback loop, README | Not started |
 
-Tests: 199 passing (`make test`). The frontend type-checks and builds (`cd frontend && npm run build`).
+Tests: 201 passing (`make test`). The frontend type-checks and builds (`cd frontend && npm run build`).
 
 ## What exists (by module)
 
@@ -65,6 +65,8 @@ These are deliberate, so don't "fix" them back without reason.
 21. **MMR rescales relevance within its pool.** Scores are percentiles over ~1,500 films, so the top 180 all sit in 0.95–1.0 and the similarity penalty (up to 0.3) swamped them: MMR was ranking by novelty and put a K-pop concert film at #2. Relevance is min-max rescaled over the pool MMR considers before applying λ.
 22. **Shorts are hidden** (`RECOMMEND_MIN_RUNTIME=40` minutes) unless they're on your watchlist. MovieLens users rate some classic shorts very highly (*Rabbit of Seville*), and they crowded the top.
 
+23. **The ranking mixes taste fit back in** (`RANK_FIT_WEIGHT=0.5`). In learned mode, films are ranked by the percentile of ½·pct(predicted rating) + ½·pct(taste fit), where taste fit is the mean of ① and ②. The "~4.4★ for you" on each card is still the learned prediction. Why: the learned blend puts ③ at 2.7★ and ① and ② at 0 (see the open item below), so 38 of the top 60 were below the median on ① or ② (acclaimed canon, not the user's kind of film). With the mix, that's 1 of 60, and the median predicted rating of the top 60 only drops from 4.44★ to 4.29★. Cost on held-out ratings: Spearman 0.52 for the ranking vs 0.62 for the prediction alone. That's expected, because the holdout measures *how you rate films you chose to watch*, while ② mostly captures *what you choose*. The metrics page shows both rows. Fixed mode (< 50 ratings) is unchanged, since ①② already carry 70% of the weight there.
+
 ## Open items / known issues
 
 - [ ] **Fold `/reviews` into the details call** (`append_to_response=credits,keywords,external_ids,reviews`). Reviews are currently a separate request per film, so this halves first-run TMDB calls (~1,181 → ~630 on the sample export). Changing the request format changes cache keys, so responses cached under the old format won't be reused.
@@ -74,7 +76,7 @@ These are deliberate, so don't "fix" them back without reason.
 - [ ] Score ① values are small with 126 ratings and `SHRINKAGE_K=3` (top directors ≈ +0.3★). That's fine for ranking, since percentiles are used, but revisit k once M6's holdout metrics exist.
 - [x] ~~Stale candidates are never pruned~~: fixed along with full replacement on account change (decision 15).
 - [x] ~~Use ml-32m for real data~~: done in `.env`. The default stays ml-latest-small (what the spec asks for in development). With ml-32m, 101 of 126 rated films and 84% of the pool get ③; 80/20 RMSE 0.48 vs 0.69 for your mean.
-- [ ] **The learned blend is almost all ③ (M6 finding, real data).** Cross-fitted on 126 ratings: ③ alone RMSE 0.454 / Spearman 0.71 (101 films), ① 0.641 / 0.34, ② 0.677 / 0.02, your mean 0.675, fixed weights 0.621 / 0.39, learned blend 0.472 / 0.62. The full model's weights are ③ 2.7★, ① 0, ② 0, votes 0.04; the partial model uses ① (0.58★). So ② barely predicts *how you rate* films you chose to watch (it's more about *what* you watch: a selection effect the rating target can't see), and the top of the list is acclaimed canon. Options: a floor on ②'s weight, a popularity de-bias for ③, or M8's adventurousness slider. The review-query idea for ② (below) is untested.
+- [x] ~~**The learned blend is almost all ③**~~: the ranking now mixes in taste fit (decision 23). Still true of the prediction itself: Cross-fitted on 126 ratings: ③ alone RMSE 0.454 / Spearman 0.71 (101 films), ① 0.641 / 0.34, ② 0.677 / 0.02, your mean 0.675, fixed weights 0.621 / 0.39, learned blend 0.472 / 0.62. The full model's weights are ③ 2.7★, ① 0, ② 0, votes 0.04; the partial model uses ① (0.58★). So ② barely predicts *how you rate* films you chose to watch (it's more about *what* you watch: a selection effect the rating target can't see), and ranking by it alone filled the top with acclaimed canon. M8's adventurousness slider could expose `RANK_FIT_WEIGHT`. The review-query idea for ② (below) is untested.
 - [ ] Some MovieLens links point at stale TMDB ids (25 "not found" enrichment errors from ③-sourced candidates per run). Harmless, but they log at ERROR and are retried each run.
 - [ ] A harmless joblib/loky "leaked semaphore" warning appears when the server is killed after a pipeline run.
 

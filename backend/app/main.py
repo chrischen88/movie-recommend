@@ -341,6 +341,7 @@ def get_metrics(session: SessionDep, pipeline: PipelineDep) -> dict[str, Any]:
         "n_with_collab": blend.n_with_collab,
         "trained_at": blend.trained_at,
         "fixed_weights": blend.fixed_weights,
+        "rank_fit_weight": cfg.rank_fit_weight,
         "full": asdict(blend.full) if blend.full else None,
         "partial": asdict(blend.partial) if blend.partial else None,
         "metrics": blend.metrics,

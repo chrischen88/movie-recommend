@@ -120,6 +120,9 @@ class Settings(BaseSettings):
     blend_holdout_fraction: float = 0.2
     blend_cv_folds: int = 5
     blend_use_vote_count: bool = True  # log TMDB vote count as a 4th blend feature
+    # Learned mode ranks by (1−w)·predicted rating + w·taste fit (mean of ① and ②),
+    # both as percentiles. 0 ranks by predicted rating alone.
+    rank_fit_weight: float = 0.5
     watchlist_boost: float = 0.05
     quality_floor_tomatometer: int = 60
     quality_floor_imdb: float = 6.5

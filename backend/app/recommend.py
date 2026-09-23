@@ -15,7 +15,7 @@ from sqlmodel import Session, col, select
 
 import numpy as np
 
-from app.blend import BlendModel
+from app.blend import BlendModel, rank_with_fit, taste_fit
 from app.collab import CollabScorer
 from app.db import Candidate, Movie, UserFilm
 from app.profile import Contribution, TasteProfile, score_profile, user_ratings
@@ -181,10 +181,12 @@ def recommend(
     watchlist_boost: float = 0.0,
     mmr_lambda: float | None = None,
     min_runtime: int = 0,
+    fit_weight: float = 0.0,
 ) -> RecResult:
     """`blend=None` averages the available scores equally. `mmr_lambda=None`
     skips MMR re-ranking. Films shorter than `min_runtime` minutes are left out
-    unless they're on the watchlist."""
+    unless they're on the watchlist. In learned mode, `fit_weight` mixes taste
+    fit into the ranking (`blend.rank_with_fit`)."""
     filters = filters or RecFilters()
     # Every unseen film in the library or candidate set is scored: a few hundred
     # to a few thousand dot products, so no nearest-neighbour cutoff. (A k-NN
@@ -223,6 +225,7 @@ def recommend(
     blend = blend or BlendModel(mode="fixed", fixed_weights={"profile": 1.0, "embedding": 1.0, "collab": 1.0})
     recs: list[Recommendation] = []
     values: list[float] = []  # what the blend ranks by: predicted stars, or a weighted mean
+    fits: list[float] = []  # taste fit, mixed into the ranking in learned mode
     for tid, sc in scores.items():
         m = movies.get(tid)
         if m is None:
@@ -234,6 +237,7 @@ def recommend(
         c_n = None if cs is None else cs.normalized
         predicted = blend.predict(p_n, sc.normalized, c_n, m.vote_count)
         values.append(predicted if predicted is not None else blend.fixed_score(p_n, sc.normalized, c_n))
+        fits.append(taste_fit(p_n, sc.normalized))
         recs.append(
             Recommendation(
                 tmdb_id=tid,
@@ -265,7 +269,9 @@ def recommend(
                 metacritic=m.metacritic,
             )
         )
-    for r, pct in zip(recs, percentile_rank(np.array(values))):
+    learned = blend.mode == "learned"
+    ranking = rank_with_fit(np.array(values), np.array(fits), fit_weight if learned else 0.0)
+    for r, pct in zip(recs, ranking):
         r.score = min(1.0, float(pct) + (watchlist_boost if r.in_watchlist else 0.0))
 
     # Scores are percentiles over the whole pool, so filtering never changes a
