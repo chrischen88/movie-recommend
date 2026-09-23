@@ -102,11 +102,16 @@ def _csv(header: list[str], rows: list[list[str]], bom: bool = False) -> bytes:
     return (("﻿" if bom else "") + buf.getvalue()).encode("utf-8")
 
 
-def build_files() -> dict[str, bytes]:
-    watched_rows = [["2024-01-01", n, y, f"https://boxd.it/{i}"] for n, y, _, i in WATCHED]
+def build_files(
+    username: str = "sampleuser", watched: list[tuple[str, str, float | None, str]] | None = None
+) -> dict[str, bytes]:
+    """`username` goes in profile.csv; `watched` replaces the WATCHED list, to
+    make a different account's export."""
+    watched = WATCHED if watched is None else watched
+    watched_rows = [["2024-01-01", n, y, f"https://boxd.it/{i}"] for n, y, _, i in watched]
     rating_rows = [
         ["2024-01-01", n, y, f"https://boxd.it/{i}", f"{r:g}"]
-        for n, y, r, i in WATCHED
+        for n, y, r, i in watched
         if r is not None
     ]
     watchlist_rows = [["2024-02-01", n, y, f"https://boxd.it/{i}"] for n, y, i in WATCHLIST]
@@ -118,7 +123,10 @@ def build_files() -> dict[str, bytes]:
         f"{ROOT}/diary.csv": _csv(DIARY_HEADER, DIARY),
         f"{ROOT}/watchlist.csv": _csv(["Date", "Name", "Year", "Letterboxd URI"], watchlist_rows),
         f"{ROOT}/reviews.csv": _csv(REVIEWS_HEADER, REVIEWS),
-        f"{ROOT}/profile.csv": _csv(["Username"], [["sampleuser"]]),
+        f"{ROOT}/profile.csv": _csv(
+            ["Date Joined", "Username", "Given Name", "Email Address"],
+            [["2020-01-01", username, "Sam", "sam@example.com"]],
+        ),
         # Decoys: same file names in folders that must be ignored.
         f"{ROOT}/deleted/ratings.csv": _csv(
             ["Date", "Name", "Year", "Letterboxd URI", "Rating"],

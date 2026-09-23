@@ -168,6 +168,38 @@ def test_daily_budget(engine: Engine) -> None:
     assert len(rec.requests) == 2
 
 
+def test_daily_budget_holds_under_concurrency(engine: Engine) -> None:
+    """Parallel workers must not all pass the budget check before any response
+    is cached (they did: 5 requests went out on a budget of 2)."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    calls: list[str] = []
+    gate = threading.Barrier(8, timeout=5)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.params["i"])
+        return httpx.Response(200, json={"ok": True})
+
+    cache = ResponseCache(engine)
+    client = CachedHttpClient(
+        namespace="omdb", base_url="https://x.test", cache=cache, rate_per_second=1000,
+        ttl_seconds=None, daily_limit=3, transport=httpx.MockTransport(handler), max_retries=0,
+    )
+
+    def one(i: int) -> str:
+        gate.wait()  # all 8 hit the budget check at the same moment
+        try:
+            client.get_json("/", {"i": f"tt{i}"})
+            return "ok"
+        except DailyBudgetExceeded:
+            return "over"
+
+    with ThreadPoolExecutor(8) as pool:
+        outcomes = list(pool.map(one, range(8)))
+    assert len(calls) == 3 and outcomes.count("ok") == 3 and outcomes.count("over") == 5
+
+
 # ------------------------------------------------------------ RateLimiter
 
 

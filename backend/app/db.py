@@ -81,6 +81,12 @@ class Movie(SQLModel, table=True):
     reviews: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     enriched_at: datetime = Field(default_factory=utcnow)
 
+    # From OMDb (milestone 6), fetched for the shortlist only; any may be missing.
+    imdb_rating: float | None = None  # 0–10
+    rt_score: int | None = None  # Rotten Tomatoes Tomatometer, 0–100
+    metacritic: int | None = None  # Metascore, 0–100
+    omdb_fetched_at: datetime | None = None
+
 
 class Candidate(SQLModel, table=True):
     """A film proposed for recommendation, and where it came from."""
@@ -88,6 +94,14 @@ class Candidate(SQLModel, table=True):
     tmdb_id: int = Field(primary_key=True)
     # e.g. ["recommendations:329865", "similar:603"]
     sources: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
+class AppState(SQLModel, table=True):
+    """Small key/value store for app-wide facts, e.g. whose export is loaded."""
+
+    key: str = Field(primary_key=True)
+    value: str
     updated_at: datetime = Field(default_factory=utcnow)
 
 

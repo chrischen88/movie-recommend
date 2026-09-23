@@ -24,6 +24,9 @@ export interface IngestRun {
     changed?: number;
     unchanged?: number;
     removed?: number;
+    /** True when the export was from a different account and replaced all data. */
+    reset?: boolean;
+    account?: string | null;
     films?: number;
     rated?: number;
     watchlist?: number;
@@ -88,6 +91,13 @@ export interface Recommendation {
   profile_score: number | null;
   profile_raw: number | null;
   profile_reasons: ProfileReason[];
+  collab_score: number | null;
+  collab_predicted: number | null;
+  /** The learned blend's predicted rating (stars); null when fixed weights are in use. */
+  predicted_rating: number | null;
+  imdb_rating: number | null;
+  rt_score: number | null;
+  metacritic: number | null;
 }
 
 /** One feature behind score ①, e.g. "Director Denis Villeneuve", +0.9★ over 4 films. */
@@ -113,14 +123,51 @@ export interface RecommendationsResponse {
   total?: number;
   matching?: number;
   facets?: Facets;
+  /** Your rated films found in MovieLens; null when there's no collaborative score. */
+  collab_films?: number | null;
+  blend_mode?: "learned" | "fixed";
 }
+
+export type RatingSource = "tmdb" | "imdb" | "rt" | "metacritic";
 
 export interface RecFilters {
   min_rating?: number;
+  rating_source?: RatingSource;
+  hide_low_quality?: boolean;
   genre?: string;
   decade?: number;
   max_runtime?: number;
   language?: string;
+}
+
+export interface MethodMetrics {
+  rmse: number;
+  spearman: number | null;
+  n: number;
+}
+
+export interface LinearBlend {
+  features: string[];
+  coef: number[];
+  intercept: number;
+  alpha: number;
+}
+
+export interface MetricsResponse {
+  ready: boolean;
+  message?: string;
+  mode?: "learned" | "fixed";
+  min_ratings_for_learning?: number;
+  n_ratings?: number;
+  n_with_collab?: number;
+  trained_at?: string;
+  fixed_weights?: Record<string, number>;
+  full?: LinearBlend | null;
+  partial?: LinearBlend | null;
+  metrics?: Record<string, MethodMetrics>;
+  collab_model?: { dataset: string; val_rmse: number; val_rmse_global_mean: number; n_users: number; n_items: number } | null;
+  omdb?: { enabled: boolean; used_today: number; daily_limit: number };
+  candidates?: { total: number; by_source: Record<string, number> };
 }
 
 export interface TasteCluster {
@@ -185,6 +232,7 @@ export const api = {
     return request<RecommendationsResponse>(`/api/recommendations?${qs}`);
   },
   taste: () => request<TasteResponse>("/api/taste"),
+  metrics: () => request<MetricsResponse>("/api/metrics"),
 };
 
 export const posterUrl = (path: string | null, size: "w92" | "w185" | "w342" = "w92") =>

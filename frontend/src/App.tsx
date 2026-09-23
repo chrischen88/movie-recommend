@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { NavLink, Route, Routes } from "react-router-dom";
 import { api, type Health } from "./api";
 import MatchReviewPage from "./pages/MatchReviewPage";
+import MetricsPage from "./pages/MetricsPage";
 import RecommendationsPage from "./pages/RecommendationsPage";
 import UploadPage from "./pages/UploadPage";
 
@@ -30,6 +31,9 @@ export default function App() {
             <NavLink to="/matches" className={navClass}>
               Matches
             </NavLink>
+            <NavLink to="/metrics" className={navClass}>
+              Metrics
+            </NavLink>
           </nav>
           <div className="ml-auto flex gap-2 text-xs">
             {health ? (
@@ -53,6 +57,7 @@ export default function App() {
           <Route path="/" element={<UploadPage />} />
           <Route path="/matches" element={<MatchReviewPage />} />
           <Route path="/recommendations" element={<RecommendationsPage />} />
+          <Route path="/metrics" element={<MetricsPage />} />
         </Routes>
       </main>
     </div>

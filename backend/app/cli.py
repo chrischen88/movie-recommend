@@ -2,6 +2,7 @@
 
     python -m app.cli ingest path/to/letterboxd-export.zip   # parse + run the pipeline
     python -m app.cli build-index                              # (re)run the pipeline only
+    python -m app.cli train [--force]                          # MovieLens model for score ③
 """
 
 from __future__ import annotations
@@ -30,6 +31,11 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         return 1
     with Session(get_engine()) as session:
         result = sync_export(session, export)
+    if result.reset:
+        from app.pipeline import get_pipeline
+
+        get_pipeline().discard_user_models()
+        print(f"export is from a different account ({export.username}): replaced all data")
     print(f"files: {', '.join(export.files_found)}")
     print(f"films: {len(export.films)} ({len(export.rated)} rated, {len(export.watchlist)} watchlist)")
     print(f"sync:  {result.summary()}")
@@ -70,6 +76,25 @@ def cmd_build_index(_args: argparse.Namespace) -> int:
     return run_pipeline()
 
 
+def cmd_train(args: argparse.Namespace) -> int:
+    """Download MovieLens if needed and train the collaborative model.
+    A no-op when a model with the current settings already exists (unless --force)."""
+    from app.movielens import MovieLensError
+    from app.pipeline import get_pipeline
+
+    pipeline = get_pipeline()
+    try:
+        stats = pipeline.train_collab(force=args.force)
+    except MovieLensError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if stats.get("trained") is False:
+        print(f"model is up to date (validation RMSE {stats['val_rmse']:.4f}); use --force to retrain")
+    else:
+        print(f"collab: {stats}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(name)s: %(message)s")
     parser = argparse.ArgumentParser(prog="app.cli")
@@ -79,6 +104,9 @@ def main(argv: list[str] | None = None) -> int:
     p_ingest.set_defaults(func=cmd_ingest)
     p_index = sub.add_parser("build-index", help="run matching/enrichment/embedding/taste")
     p_index.set_defaults(func=cmd_build_index)
+    p_train = sub.add_parser("train", help="download MovieLens and train the collaborative model")
+    p_train.add_argument("--force", action="store_true", help="retrain even if the model is current")
+    p_train.set_defaults(func=cmd_train)
     args = parser.parse_args(argv)
     return int(args.func(args))
 

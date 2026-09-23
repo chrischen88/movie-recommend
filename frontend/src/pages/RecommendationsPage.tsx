@@ -73,10 +73,21 @@ export default function RecommendationsPage() {
       <div>
         <h1 className="text-2xl font-semibold">Recommendations</h1>
         <p className="text-zinc-400 text-sm mt-1">
-          Ranked by the average of your taste profile ① and embedding similarity ②
-          {taste?.n_rated ? ` (built from ${taste.n_rated} rated films` : ""}
-          {taste?.clusters.length ? `, ${taste.clusters.length} taste clusters)` : taste?.n_rated ? ")" : ""}.
-          The collaborative score and learned blend arrive in later milestones.
+          {recs.blend_mode === "learned"
+            ? "Ranked by a blend of your taste profile ①, embedding similarity ②"
+            : "Ranked by fixed weights on your taste profile ①, embedding similarity ②"}
+          {recs.collab_films != null ? " and collaborative score ③" : ""}
+          {recs.blend_mode === "learned"
+            ? ", weighted by how well each one predicted your own ratings"
+            : ` (too few ratings to learn weights yet)`}
+          {taste?.n_rated ? `. Built from ${taste.n_rated} rated films` : ""}
+          {taste?.clusters.length ? ` in ${taste.clusters.length} taste clusters` : ""}.
+          {recs.collab_films != null
+            ? ` ③ compares ${recs.collab_films} of your ratings with MovieLens users; films not in MovieLens are ranked on ① and ② only.`
+            : " The collaborative score ③ appears once the MovieLens model is trained (make train)."}{" "}
+          <Link to="/metrics" className="text-emerald-400 hover:underline">
+            How well does it work?
+          </Link>
         </p>
       </div>
 
@@ -115,7 +126,7 @@ export default function RecommendationsPage() {
           className={`grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-5 transition-opacity ${loading ? "opacity-50" : ""}`}
         >
           {shown.map((r, i) => (
-            <RecCard key={r.tmdb_id} rec={r} rank={recs.items.indexOf(r) + 1 || i + 1} />
+            <RecCard key={r.tmdb_id} rec={r} rank={recs.items.indexOf(r) + 1 || i + 1} collabOn={recs.collab_films != null} />
           ))}
         </div>
       )}
@@ -144,7 +155,7 @@ function Chip({
   );
 }
 
-function RecCard({ rec, rank }: { rec: Recommendation; rank: number }) {
+function RecCard({ rec, rank, collabOn }: { rec: Recommendation; rank: number; collabOn: boolean }) {
   const poster = posterUrl(rec.poster_path, "w342");
   return (
     <article className="group flex flex-col overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900/40">
@@ -172,15 +183,15 @@ function RecCard({ rec, rank }: { rec: Recommendation; rank: number }) {
               .filter(Boolean)
               .join(" · ")}
           </p>
-          {rec.vote_average !== null && (
+          {rec.predicted_rating !== null && (
             <p
-              className="mt-0.5 text-xs text-amber-300/90"
-              title={rec.vote_count ? `TMDB user score from ${rec.vote_count.toLocaleString()} votes` : "TMDB user score"}
+              className="mt-1 text-sm font-medium text-emerald-300"
+              title="The learned blend's estimate of how you'd rate it"
             >
-              ★ {rec.vote_average.toFixed(1)}
-              <span className="text-zinc-500"> TMDB</span>
+              ~{rec.predicted_rating.toFixed(1)}★ for you
             </p>
           )}
+          <Ratings rec={rec} />
         </div>
         {rec.profile_score !== null && (
           <ScoreBar
@@ -190,6 +201,17 @@ function RecCard({ rec, rank }: { rec: Recommendation; rank: number }) {
           />
         )}
         <ScoreBar label="② similarity" value={rec.embedding_score} detail={`cos ${rec.similarity.toFixed(2)}`} />
+        {rec.collab_score !== null && rec.collab_predicted !== null ? (
+          <ScoreBar
+            label={`③ others like you · ${rec.collab_predicted.toFixed(1)}★`}
+            value={rec.collab_score}
+            detail={`Predicted rating ${rec.collab_predicted.toFixed(2)}★ from MovieLens users with similar ratings`}
+          />
+        ) : collabOn && (
+          <p className="text-[11px] text-zinc-600" title="Not in MovieLens (often too recent), so ranked on ① and ② only">
+            ③ not in MovieLens
+          </p>
+        )}
         {rec.profile_reasons.length > 0 && (
           <ul className="space-y-0.5 text-xs">
             {rec.profile_reasons.slice(0, 3).map((r) => (
@@ -212,6 +234,31 @@ function RecCard({ rec, rank }: { rec: Recommendation; rank: number }) {
         </p>
       </div>
     </article>
+  );
+}
+
+function Ratings({ rec }: { rec: Recommendation }) {
+  const items: { label: string; value: string; title: string }[] = [];
+  if (rec.vote_average !== null) {
+    items.push({
+      label: "TMDB",
+      value: rec.vote_average.toFixed(1),
+      title: rec.vote_count ? `TMDB user score from ${rec.vote_count.toLocaleString()} votes` : "TMDB user score",
+    });
+  }
+  if (rec.imdb_rating !== null) items.push({ label: "IMDb", value: rec.imdb_rating.toFixed(1), title: "IMDb rating" });
+  if (rec.rt_score !== null) items.push({ label: "RT", value: `${rec.rt_score}%`, title: "Rotten Tomatoes Tomatometer" });
+  if (rec.metacritic !== null) items.push({ label: "MC", value: String(rec.metacritic), title: "Metacritic Metascore" });
+  if (!items.length) return null;
+  return (
+    <p className="mt-0.5 flex flex-wrap gap-x-2 text-xs text-amber-300/90">
+      {items.map((it) => (
+        <span key={it.label} title={it.title} className="tabular-nums">
+          {it.value}
+          <span className="text-zinc-500"> {it.label}</span>
+        </span>
+      ))}
+    </p>
   );
 }
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from dataclasses import asdict
 from typing import Annotated, Any, Literal
 
@@ -12,13 +13,15 @@ from pydantic import BaseModel
 from sqlmodel import Session, col, select
 
 from app import matching
+from app.blend import BlendModel
+from app.cache import ResponseCache
+from app.collab import load_scorer
 from app.config import get_settings
-from app.db import IngestRun, Movie, UserFilm, get_session, utcnow
+from app.db import Candidate, IngestRun, Movie, UserFilm, get_session, utcnow
 from app.ingest import sync_export
 from app.letterboxd import ExportError, parse_export
 from app.pipeline import STAGES, Pipeline, TmdbUnavailable, get_pipeline
-from app.profile import load_profile
-from app.recommend import RecFilters, recommend
+from app.recommend import RatingSource, RecFilters, eligible_ids
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s"
@@ -85,8 +88,11 @@ async def upload_export(
             raise HTTPException(400, str(exc)) from exc
 
         result = sync_export(session, export)
+        if result.reset:
+            pipeline.discard_user_models()
         run.stats = {
             **result.summary(),
+            "account": result.account,
             "films": len(export.films),
             "rated": len(export.rated),
             "watchlist": len(export.watchlist),
@@ -272,36 +278,35 @@ def get_recommendations(
     session: SessionDep,
     pipeline: PipelineDep,
     limit: int = 40,
-    min_rating: Annotated[float | None, Query(ge=0, le=10)] = None,
+    min_rating: Annotated[float | None, Query(ge=0, le=100)] = None,
+    rating_source: RatingSource = "tmdb",
+    hide_low_quality: bool = False,
     genre: Annotated[list[str] | None, Query()] = None,
     decade: Annotated[int | None, Query(ge=1870, le=2100)] = None,
     max_runtime: Annotated[int | None, Query(gt=0)] = None,
     language: str | None = None,
 ) -> dict[str, Any]:
     reason = _not_ready(pipeline)
-    model = pipeline.load_taste()
-    if reason or model is None or pipeline.store is None:
+    if reason:
         return {"ready": False, "message": reason, "items": []}
+    if min_rating is not None and rating_source in ("tmdb", "imdb") and min_rating > 10:
+        raise HTTPException(422, f"{rating_source} ratings are 0–10")
+    cfg = pipeline.settings
     filters = RecFilters(
         min_rating=min_rating,
+        rating_source=rating_source,
+        hide_low_quality=hide_low_quality,
+        quality_rt=cfg.quality_floor_tomatometer,
+        quality_imdb=cfg.quality_floor_imdb,
         genres=tuple(genre or ()),
         decade=decade,
         max_runtime=max_runtime,
         language=language or None,
     )
-    result = recommend(
-        session,
-        pipeline.store,
-        model,
-        limit=max(1, min(limit, 200)),
-        k_per_vector=pipeline.settings.vector_query_k,
-        mode=pipeline.settings.embedding_score_mode,
-        filters=filters,
-        profile=load_profile(session, pipeline.settings.shrinkage_k),
-        feature_weights=pipeline.settings.feature_weights,
-        reasons_per_film=pipeline.settings.profile_reasons_per_film,
-        min_reason_stars=pipeline.settings.profile_min_reason_stars,
-    )
+    out = pipeline.recommend(session, limit=max(1, min(limit, 200)), filters=filters)
+    if out is None:
+        return {"ready": False, "message": _not_ready(pipeline), "items": []}
+    result, blend = out
     return {
         "ready": True,
         "message": None,
@@ -309,6 +314,43 @@ def get_recommendations(
         "total": result.total,
         "matching": result.matching,
         "facets": asdict(result.facets),
+        "collab_films": result.collab_films,
+        "blend_mode": blend.mode,
+    }
+
+
+@app.get("/api/metrics")
+def get_metrics(session: SessionDep, pipeline: PipelineDep) -> dict[str, Any]:
+    """How well each score and the blend predict the user's own held-out ratings,
+    plus the blend weights and data-source usage."""
+    cfg = pipeline.settings
+    blend = BlendModel.load(cfg.blend_model_path)
+    if blend is None:
+        return {"ready": False, "message": "No blend yet: upload an export and let processing finish."}
+    scorer = load_scorer(cfg.collab_model_path, cfg.collab_min_item_ratings) if cfg.collab_enabled else None
+    sources: Counter[str] = Counter()
+    for cand in session.exec(select(Candidate)):
+        for kind in {src.split(":", 1)[0] for src in cand.sources}:
+            sources[kind] += 1
+    start_of_day = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    return {
+        "ready": True,
+        "mode": blend.mode,
+        "min_ratings_for_learning": cfg.blend_min_ratings_for_learning,
+        "n_ratings": blend.n_ratings,
+        "n_with_collab": blend.n_with_collab,
+        "trained_at": blend.trained_at,
+        "fixed_weights": blend.fixed_weights,
+        "full": asdict(blend.full) if blend.full else None,
+        "partial": asdict(blend.partial) if blend.partial else None,
+        "metrics": blend.metrics,
+        "collab_model": scorer.model.meta if scorer else None,
+        "omdb": {
+            "enabled": pipeline.omdb is not None,
+            "used_today": ResponseCache(session.get_bind()).count_created_since("omdb", start_of_day),  # type: ignore[arg-type]
+            "daily_limit": cfg.omdb_daily_limit,
+        },
+        "candidates": {"total": len(eligible_ids(session)), "by_source": dict(sources.most_common())},
     }
 
 

@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     tmdb_requests_per_second: float = 20.0
     omdb_requests_per_second: float = 5.0
     omdb_daily_limit: int = 1000
+    omdb_shortlist_size: int = 150  # top-ranked candidates looked up on OMDb each run
     http_max_retries: int = 5
     http_backoff_base_seconds: float = 0.5
     http_backoff_max_seconds: float = 30.0
@@ -56,19 +57,37 @@ class Settings(BaseSettings):
     # --- TMDB matching ---
     match_low_confidence_threshold: float = 0.75
 
-    # --- MovieLens ---
-    movielens_dataset: str = "ml-latest-small"  # or "ml-32m"
+    # --- MovieLens / collaborative filtering (score ③) ---
+    movielens_dataset: str = "ml-latest-small"  # or "ml-32m" (≈240 MB download, minutes to train)
+    movielens_auto_download: bool = True  # fetch the dataset during a pipeline run if missing
+    collab_enabled: bool = True
+    collab_factors: int = 32
+    collab_iterations: int = 15
+    collab_reg: float = 0.1  # weighted-λ; best of 0.02–0.2 on ml-latest-small (val RMSE 0.845)
+    collab_val_fraction: float = 0.05  # MovieLens ratings held out to report RMSE
+    collab_seed: int = 0
+    collab_min_item_ratings: int = 5  # films rated by fewer MovieLens users get no score ③
+    collab_min_user_ratings: int = 5  # your rated films that must be in MovieLens for score ③
 
     # --- Candidate generation ---
-    candidate_seed_count: int = 25  # top-rated films used as recommendation seeds
+    candidate_seed_count: int = 60  # top-rated films used as recommendation seeds
     candidate_seed_min_rating: float = 4.0
     candidate_min_votes: int = 50  # skip obscure TMDB entries with too few votes
+    # /discover/movie: acclaimed films in the genres and languages your profile likes most.
+    candidate_discover_genres: int = 4
+    candidate_discover_languages: int = 2  # non-English languages you rate above average
+    candidate_discover_pages: int = 2
+    candidate_discover_min_votes: int = 300
+    # Score ③'s top predictions among films you haven't seen (needs a MovieLens model).
+    candidate_collab_count: int = 150
+    # ...among films with this many MovieLens ratings (③ itself scores films with
+    # `collab_min_item_ratings`; this only stops niche films entering on noise).
+    candidate_collab_min_ratings: int = 100
 
     # --- Embeddings / vector DB ---
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     embedding_batch_size: int = 64
     vector_collection: str = "movies"
-    vector_query_k: int = 300  # neighbours fetched per taste vector / cluster centroid
     taste_cluster_min_rating: float = 4.0
     taste_cluster_k_range: tuple[int, int] = (3, 6)
     # A k is only eligible if every cluster has at least this many films, so a
@@ -100,10 +119,12 @@ class Settings(BaseSettings):
     blend_fallback_weights: tuple[float, float, float] = (0.3, 0.4, 0.3)
     blend_holdout_fraction: float = 0.2
     blend_cv_folds: int = 5
+    blend_use_vote_count: bool = True  # log TMDB vote count as a 4th blend feature
     watchlist_boost: float = 0.05
     quality_floor_tomatometer: int = 60
     quality_floor_imdb: float = 6.5
     mmr_lambda: float = 0.7
+    recommend_min_runtime: int = 40  # minutes; hides shorts (unless watchlisted). 0 shows everything
     top_n: int = 20
 
     # --- LLM ---
@@ -121,6 +142,22 @@ class Settings(BaseSettings):
     @property
     def taste_model_path(self) -> Path:
         return self.data_dir / "taste_model.json"
+
+    @property
+    def blend_model_path(self) -> Path:
+        return self.data_dir / "blend_model.json"
+
+    @property
+    def movielens_root(self) -> Path:
+        return self.data_dir / "movielens"
+
+    @property
+    def movielens_dir(self) -> Path:
+        return self.movielens_root / self.movielens_dataset
+
+    @property
+    def collab_model_path(self) -> Path:
+        return self.movielens_root / f"model-{self.movielens_dataset}.npz"
 
 
 @lru_cache

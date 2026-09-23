@@ -8,6 +8,8 @@ from sqlalchemy import Engine
 from sqlmodel import Session
 
 from app.db import make_engine
+from app.ingest import sync_export
+from app.letterboxd import parse_export
 from tests.fixtures.sample_export import build_files, build_zip
 
 
@@ -30,3 +32,11 @@ def sample_zip() -> bytes:
 @pytest.fixture
 def sample_files() -> dict[str, bytes]:
     return build_files()
+
+
+@pytest.fixture
+def ingested(engine: Engine, sample_zip: bytes) -> Engine:
+    """A DB with the sample export synced, before any pipeline run."""
+    with Session(engine) as s:
+        sync_export(s, parse_export(sample_zip))
+    return engine

@@ -76,6 +76,12 @@ class TmdbClient:
         body = self.http.get_json("/discover/movie", params)
         return list(body.get("results", [])) if isinstance(body, dict) else []
 
+    def genre_ids(self) -> dict[str, int]:
+        """Genre name → TMDB id (we store genres by name; /discover wants ids)."""
+        body = self.http.get_json("/genre/movie/list", {"language": "en"})
+        genres = body.get("genres", []) if isinstance(body, dict) else []
+        return {g["name"]: int(g["id"]) for g in genres if g.get("name") and g.get("id") is not None}
+
 
 def year_of(release_date: str | None) -> int | None:
     if release_date and len(release_date) >= 4 and release_date[:4].isdigit():

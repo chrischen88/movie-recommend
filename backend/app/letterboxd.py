@@ -28,6 +28,9 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 EXPECTED_FILES = ("ratings.csv", "watched.csv", "diary.csv", "watchlist.csv", "reviews.csv")
+# Identifies the account, so a different person's export replaces the data
+# instead of being merged into it. Only the Username column is read.
+PROFILE_FILE = "profile.csv"
 EXCLUDED_DIRS = {"deleted", "orphaned", "likes", "lists", "__macosx"}
 
 
@@ -62,6 +65,7 @@ class LetterboxdExport:
     films: dict[str, ParsedFilm]
     files_found: list[str]
     warnings: list[str]
+    username: str | None = None  # from profile.csv; None if the export has none
 
     @property
     def rated(self) -> list[ParsedFilm]:
@@ -128,14 +132,16 @@ def _cell(row: pd.Series, col: str) -> str:
 # ---------------------------------------------------------------- zip handling
 
 
-def _locate_files(zf: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
+def _locate_files(
+    zf: zipfile.ZipFile, names: tuple[str, ...] = EXPECTED_FILES
+) -> dict[str, zipfile.ZipInfo]:
     found: dict[str, zipfile.ZipInfo] = {}
     for info in zf.infolist():
         if info.is_dir():
             continue
         path = PurePosixPath(info.filename)
         name = path.name.lower()
-        if name not in EXPECTED_FILES:
+        if name not in names:
             continue
         if any(part.lower() in EXCLUDED_DIRS for part in path.parts[:-1]):
             continue
@@ -145,7 +151,7 @@ def _locate_files(zf: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
     return found
 
 
-def _read_csv(raw: bytes, filename: str, warnings: list[str]) -> pd.DataFrame:
+def _read_csv(raw: bytes, filename: str, warnings: list[str], required: str = "Name") -> pd.DataFrame:
     def warn(msg: str) -> None:
         log.warning(msg)
         warnings.append(msg)
@@ -170,8 +176,8 @@ def _read_csv(raw: bytes, filename: str, warnings: list[str]) -> pd.DataFrame:
         warn(f"{filename}: could not parse ({exc})")
         return pd.DataFrame()
     df.columns = [str(c).strip() for c in df.columns]
-    if "Name" not in df.columns:
-        warn(f"{filename}: missing required 'Name' column; skipped")
+    if required not in df.columns:
+        warn(f"{filename}: missing required '{required}' column; skipped")
         return pd.DataFrame()
     return df
 
@@ -303,6 +309,18 @@ class _Merger:
             self.films[key].review_text = "\n\n".join(texts)
 
 
+def _read_username(zf: zipfile.ZipFile, max_csv_bytes: int, warnings: list[str]) -> str | None:
+    info = _locate_files(zf, (PROFILE_FILE,)).get(PROFILE_FILE)
+    if info is None or info.file_size > max_csv_bytes:
+        log.info("export has no usable %s: account can't be identified", PROFILE_FILE)
+        return None
+    df = _read_csv(zf.read(info), PROFILE_FILE, warnings, required="Username")
+    if df.empty:
+        return None  # _read_csv already warned
+    name = _cell(df.iloc[0], "Username").strip().lower()
+    return name or None
+
+
 def parse_export(source: bytes | str | Path, *, max_csv_bytes: int = 100 * 1024 * 1024) -> LetterboxdExport:
     """Parse a Letterboxd export ZIP (bytes or path)."""
     buf = io.BytesIO(source) if isinstance(source, bytes) else open(source, "rb")
@@ -326,6 +344,7 @@ def parse_export(source: bytes | str | Path, *, max_csv_bytes: int = 100 * 1024 
                 if info.file_size > max_csv_bytes:
                     raise ExportError(f"{name} is too large ({info.file_size} bytes)")
                 frames[name] = _read_csv(zf.read(info), name, merger.warnings)
+            username = _read_username(zf, max_csv_bytes, merger.warnings)
     finally:
         buf.close()
 
@@ -344,7 +363,7 @@ def parse_export(source: bytes | str | Path, *, max_csv_bytes: int = 100 * 1024 
     merger.finalize()
 
     export = LetterboxdExport(
-        films=merger.films, files_found=sorted(located), warnings=merger.warnings
+        films=merger.films, files_found=sorted(located), warnings=merger.warnings, username=username
     )
     log.info(
         "parsed export: %d films (%d rated, %d watched, %d watchlist), %d warnings",

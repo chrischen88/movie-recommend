@@ -1,6 +1,17 @@
-import type { Facets, RecFilters } from "../api";
+import type { Facets, RatingSource, RecFilters } from "../api";
 
-const RATING_OPTIONS = [6, 6.5, 7, 7.5, 8];
+const RATING_SOURCES: [RatingSource, string][] = [
+  ["tmdb", "TMDB"],
+  ["imdb", "IMDb"],
+  ["rt", "Rotten Tomatoes"],
+  ["metacritic", "Metacritic"],
+];
+const RATING_OPTIONS: Record<RatingSource, [number, string][]> = {
+  tmdb: [6, 6.5, 7, 7.5, 8].map((r) => [r, `★ ${r.toFixed(1)}+`]),
+  imdb: [6, 6.5, 7, 7.5, 8].map((r) => [r, `★ ${r.toFixed(1)}+`]),
+  rt: [60, 75, 90].map((r) => [r, `${r}%+`]),
+  metacritic: [60, 70, 80].map((r) => [r, `${r}+`]),
+};
 const RUNTIME_OPTIONS = [90, 120, 150];
 
 const languageNames = (() => {
@@ -24,8 +35,11 @@ export function filtersFromParams(params: URLSearchParams): RecFilters {
     const v = params.get(k);
     return v !== null && v !== "" && !Number.isNaN(Number(v)) ? Number(v) : undefined;
   };
+  const source = params.get("rating_source");
   return {
     min_rating: num("min_rating"),
+    rating_source: RATING_SOURCES.some(([s]) => s === source) ? (source as RatingSource) : undefined,
+    hide_low_quality: params.get("hide_low_quality") === "true" || undefined,
     genre: params.get("genre") || undefined,
     decade: num("decade"),
     max_runtime: num("max_runtime"),
@@ -36,12 +50,14 @@ export function filtersFromParams(params: URLSearchParams): RecFilters {
 export function filtersToParams(filters: RecFilters): URLSearchParams {
   const params = new URLSearchParams();
   for (const [k, v] of Object.entries(filters)) {
-    if (v !== undefined && v !== "") params.set(k, String(v));
+    if (v !== undefined && v !== "" && v !== false) params.set(k, String(v));
   }
+  if (filters.min_rating === undefined) params.delete("rating_source"); // meaningless on its own
   return params;
 }
 
-export const hasFilters = (f: RecFilters) => Object.values(f).some((v) => v !== undefined && v !== "");
+export const hasFilters = (f: RecFilters) =>
+  Object.entries(f).some(([k, v]) => k !== "rating_source" && v !== undefined && v !== "" && v !== false);
 
 export default function FilterBar({
   filters,
@@ -55,15 +71,23 @@ export default function FilterBar({
   const set = <K extends keyof RecFilters>(key: K, value: RecFilters[K]) =>
     onChange({ ...filters, [key]: value });
   const numOrUndef = (v: string) => (v === "" ? undefined : Number(v));
+  const source: RatingSource = filters.rating_source ?? "tmdb";
 
   return (
     <div className="flex flex-wrap items-end gap-3 rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
-      <Field label="Min rating (TMDB)">
-        <Select
-          value={filters.min_rating ?? ""}
-          onChange={(v) => set("min_rating", numOrUndef(v))}
-          options={[["", "Any"], ...RATING_OPTIONS.map((r) => [String(r), `★ ${r.toFixed(1)}+`] as [string, string])]}
-        />
+      <Field label="Min rating">
+        <div className="flex gap-1">
+          <Select
+            value={source}
+            onChange={(v) => onChange({ ...filters, rating_source: v as RatingSource, min_rating: undefined })}
+            options={RATING_SOURCES}
+          />
+          <Select
+            value={filters.min_rating ?? ""}
+            onChange={(v) => set("min_rating", numOrUndef(v))}
+            options={[["", "Any"], ...RATING_OPTIONS[source].map(([r, label]) => [String(r), label] as [string, string])]}
+          />
+        </div>
       </Field>
       <Field label="Genre">
         <Select
@@ -106,6 +130,18 @@ export default function FilterBar({
           ]}
         />
       </Field>
+      <label
+        className="flex items-center gap-2 self-center pt-4 text-sm text-zinc-300"
+        title="Hide films below Rotten Tomatoes 60% and IMDb 6.5 (TMDB 6.5 when neither is known)"
+      >
+        <input
+          type="checkbox"
+          checked={!!filters.hide_low_quality}
+          onChange={(e) => set("hide_low_quality", e.target.checked || undefined)}
+          className="accent-emerald-500"
+        />
+        Hide low quality
+      </label>
       {hasFilters(filters) && (
         <button
           onClick={() => onChange({})}

@@ -13,25 +13,29 @@ _Last updated: 2026-09-23_
 | 3 | Embeddings + Chroma, taste vector/clusters, score ②, basic recs page | ✅ Done |
 | — | Recommendation filters (requested outside the plan) | ✅ Done |
 | 4 | Score ① (taste profile) with explanations | ✅ Done |
-| 5 | MovieLens ingestion + score ③ | ⏭ Next |
-| 6 | Candidate gen (discover), OMDb, learned blend, MMR, metrics page | Not started |
-| 7 | OpenAI layer: re-rank, explanations, natural-language requests | Not started |
+| 5 | MovieLens ingestion + score ③ | ✅ Done |
+| 6 | Candidate gen (discover), OMDb, learned blend, MMR, metrics page | ✅ Done |
+| 7 | OpenAI layer: re-rank, explanations, natural-language requests | ⏭ Next |
 | 8 | UI polish, taste profile page, feedback loop, README | Not started |
 
-Tests: 128 passing (`make test`). The frontend type-checks and builds (`cd frontend && npm run build`).
+Tests: 199 passing (`make test`). The frontend type-checks and builds (`cd frontend && npm run build`).
 
 ## What exists (by module)
 
 - `backend/app/letterboxd.py`: parses the ZIP and merges the CSVs on a normalized `title|year` key.
 - `backend/app/cache.py`: SQLite response cache with TTL, rate limiter, retry/backoff client, and an optional daily budget (for OMDb).
-- `backend/app/ingest.py`: incremental sync into SQLite using a content hash per film.
+- `backend/app/ingest.py`: syncs an export into SQLite. Same account: incremental, using a content hash per film. Different account (from `profile.csv`'s Username): full replace (decision 15).
 - `backend/app/tmdb.py`, `matching.py`: TMDB client and title/year matching with confidence scores.
-- `backend/app/pipeline.py`: background run: matching → enrichment → candidates → embedding → taste.
+- `backend/app/pipeline.py`: background run: matching → enrichment → collab → candidates → embedding → taste → blend → omdb. The collab stage trains once, then is a no-op until the settings change; if MovieLens can't be fetched it's skipped with a message, and the run still succeeds. Candidates come from four sources: TMDB recommendations and similar lists for the top 60 films rated ≥ 4.0 (`CANDIDATE_SEED_COUNT`, was 25), `/discover/movie` for the profile's best genres and non-English languages, and ③'s top predictions. The blend stage refits only when its inputs' fingerprint changes. The OMDb stage fetches the top-150 shortlist once per `CACHE_TTL_OMDB`; a bad key or an exhausted budget skips it without failing the run.
 - `backend/app/embeddings.py`, `vectorstore.py`, `taste.py`: film documents, the `VectorStore` interface (Chroma + in-memory), the taste vector, clusters, and score ②.
 - `backend/app/profile.py`: score ①. Builds the taste profile (shrunk mean rating deviation per director/genre/actor/keyword/decade/language/country), scores candidates, and keeps the top contributions as explanations. Also `user_ratings()`, which the taste-vector build shares.
-- `backend/app/recommend.py`: builds the ranked list (score = mean of ① and ② until M6), applies `RecFilters` (min TMDB rating, genre, decade, max runtime, language) and computes facets.
-- `backend/app/main.py`: FastAPI. Routes: `/api/health`, `/api/upload`, `/api/ingest/{id|latest|resume}`, `/api/films`, `/api/matches[/set|/accept|/ignore]`, `/api/recommendations`, `/api/taste`.
-- `frontend/`: Upload (progress stepper), Matches (review/fix), and Recommendations (poster grid, filter bar, cluster chips, ①/② bars, up to 3 "why" lines per card) pages.
+- `backend/app/movielens.py`: downloads the MovieLens ZIP (streamed, atomic) and loads ratings plus the movieId → tmdbId links.
+- `backend/app/blend.py`: cross-fitted out-of-fold ①②③ for your rated films, a non-negative Ridge blend (with and without ③), fixed-weight fallback, and the metrics (decision 17).
+- `backend/app/omdb.py`: OMDb client (IMDb rating, Rotten Tomatoes, Metascore) over `CachedHttpClient` with the daily budget.
+- `backend/app/collab.py`: score ③. Explicit ALS with biases (numpy/scipy), a saved base model, the user folded in per request, and predicted stars per candidate.
+- `backend/app/recommend.py`: scores every eligible film, ranks by the blend's predicted rating (or the fixed-weight score), adds the watchlist boost, applies `RecFilters` (min rating from TMDB/IMDb/RT/Metacritic, quality floor, genre, decade, max runtime, language), hides shorts, then re-ranks with MMR.
+- `backend/app/main.py`: FastAPI. Routes: `/api/health`, `/api/upload`, `/api/ingest/{id|latest|resume}`, `/api/films`, `/api/matches[/set|/accept|/ignore]`, `/api/recommendations`, `/api/taste`, `/api/metrics`.
+- `frontend/`: Upload (progress stepper), Matches (review/fix), Recommendations (poster grid, filter bar, cluster chips, predicted "~4.5★ for you", TMDB/IMDb/RT/Metacritic ratings, ①②③ bars, up to 3 "why" lines per card) and Metrics (blend weights, held-out accuracy per method, candidate sources, MovieLens and OMDb usage) pages.
 
 ## Decisions & deviations from the spec
 
@@ -43,11 +47,23 @@ These are deliberate, so don't "fix" them back without reason.
 4. **A basic candidate pool was pulled into M3.** It uses TMDB recommendations and similar lists from the top 25 films rated ≥ 4.0, skipping films with fewer than 50 votes (`CANDIDATE_MIN_VOTES`). M6 adds `/discover/movie`.
 5. **Match statuses:** matched / low_confidence / unmatched / manual / error / ignored. Manual and ignored decisions are never overwritten. An ignored film has its `tmdb_id` cleared so it can't leak into training. Errored films are retried on the next run.
 6. **Ambiguous matches** (a near-tie between two films that both have real vote counts) are pushed into review. A same-name obscure film is simply outvoted.
-7. **Collaborative filtering (M5, planned):** use a numpy/scipy implementation, because `implicit` may lack Python 3.13 wheels.
+7. **Collaborative filtering is our own numpy/scipy ALS,** because `implicit` may lack Python 3.13 wheels and targets implicit feedback anyway. It uses weighted-λ regularization. On ml-latest-small it reaches a validation RMSE of 0.844 against 1.054 for the global mean (reg 0.1, k 32, 15 iterations, 2.5 s).
 8. **The DB auto-migrates by adding new columns** (`db._add_missing_columns`), so new model fields don't require deleting the DB.
 9. **Score ① divides each feature type's sum by √(values of that type).** The spec says a plain weighted sum, but TMDB films carry anywhere from 3 to 40+ keywords, and each keyword seen on even one rated film has a nonzero shrunk value. A plain sum lets keyword count swamp the director. The √n scaling keeps multi-valued types comparable while still rewarding several matches.
 10. **Score ① is computed per request, not stored.** It needs only the local `movie` table and takes milliseconds for a few hundred rated films, so it's always in sync with manual match fixes, with no pipeline stage or file to go stale.
 11. **Weak explanations are hidden.** Contributions under `PROFILE_MIN_REASON_STARS` (0.05★) still count toward the score but aren't shown. Features on every rated film (e.g. all Drama) have a zero value by construction; float noise is snapped to 0 so they don't show up as "−0.0★".
+12. **The MovieLens ZIP bypasses `CachedHttpClient`.** It's a static file download (1–240 MB), not a JSON API; the cache stores JSON bodies in SQLite. It's streamed to disk with retries, extracted to a staging dir and renamed, so a failed download never looks complete. It's fetched once. `MOVIELENS_AUTO_DOWNLOAD=false` stops the pipeline from fetching it (tests set this).
+13. **The user is folded in, not trained in.** The spec says to add the user as a new row and train. Instead, the base model is trained once on MovieLens and saved (`data/movielens/model-<dataset>.npz`, keyed by a fingerprint of dataset plus hyperparameters). The user's factors and bias come from one ALS user step against the frozen item factors. That's identical to the new-row result for the user's own vector, minus their negligible pull on 9.7k item vectors. It takes microseconds, so it runs per request, always matches the current ratings, and M6's 80/20 holdout needs no retraining.
+14. **Missing ③ means averaging the others.** Films not in MovieLens, or rated by fewer than `COLLAB_MIN_ITEM_RATINGS` (5) users there, get `collab_score = null`, and their blended score uses ① and ② only (since M6, the blend's *partial* model; decision 17). Score ③ is percentile-ranked only among candidates that have it. If fewer than `COLLAB_MIN_USER_RATINGS` (5) of your films are in MovieLens, ③ is off entirely.
+15. **One library at a time; a different account's export replaces it.** The export's `profile.csv` Username is stored (`appstate` table). Uploading a *different* account deletes all user films and candidates before syncing, and discards `taste_model.json`. Matching, candidates, index membership and the taste model are then rebuilt, which is cheap because TMDB responses, `movie` metadata, embeddings and the MovieLens model are user-independent and stay cached. The same account (a newer export) stays incremental and keeps manual match fixes. A DB with films but no recorded account (from before this) is reset on the next upload. An export without `profile.csv` is assumed to be the same account. `test_other_account_upload_equals_fresh_install` asserts that uploading A then B matches a fresh install of B: same films, matches, candidates, scores and taste. Also: the candidate table is now *replaced* on each run (only current seeds' results survive, except those from seeds whose fetch failed). The index holds only the user's films plus current candidates; other `movie` rows are metadata cache only. `recommend()` also intersects the pool with the current library, so a failed or partial run can't surface stale films. Trade-off: switching accounts re-embeds films that were pruned from the index (local compute, no API calls).
+16. **Every eligible film is scored; there's no nearest-neighbour cutoff.** Until now the pool was the union of each taste vector's 300 nearest index neighbours (`VECTOR_QUERY_K`, now removed). That made sense when ② was the only score. Once ① and ③ count equally, it dropped films those scores rate highly: on the real data it scored 583 of 792 eligible films. Now every unseen current candidate or watchlist film is scored. That's one embedding fetch plus a few matrix products, trivial at this size. Revisit only if the candidate set grows to tens of thousands.
+
+17. **The blend is fitted on cross-fitted scores, not an 80/20 split.** The spec says hold out 20%, score it from the other 80%, and fit Ridge with 5-fold CV. With ~126 ratings a single 20% holdout gives only 25 training rows. Instead, every rated film gets out-of-fold ①②③: split the ratings into 5 folds, and for each fold rebuild the profile, taste vector/clusters and ③'s fold-in from the other four, then score the held-out fold as percentiles *within the real candidate pool* (so the features mean the same thing at training and serving time). Ridge is then fitted on all 126 rows, with α picked by CV, and the reported metrics are CV predictions too. `positive=True`: a score that doesn't help gets weight 0 rather than a negative weight nobody can explain. Two models are fitted: *full* (①②③ + log votes) for films in MovieLens and *partial* (①② + log votes) for the rest, since ③ is missing for ~16% of the pool. Below `BLEND_MIN_RATINGS_FOR_LEARNING` (50) the fixed 0.3/0.4/0.3 weights are used (a missing ③ spreads its weight over ①②). Metrics are still reported from 10 ratings.
+18. **OMDb is shortlist-only and its failure is non-fatal.** Only the top `OMDB_SHORTLIST_SIZE` (150) films by blend are looked up, each once per TTL. A 401 raises `OmdbUnavailable` (not `TmdbUnavailable`) so a bad OMDb key skips that stage only. The daily budget is enforced race-free: parallel workers reserve a slot under a lock before sending, and release it if the request fails.
+19. **The quality floor falls back to TMDB.** "Hide low quality" keeps a film if RT ≥ 60 or IMDb ≥ 6.5. A film without OMDb data (outside the shortlist, or no key) is judged by TMDB ≥ 6.5 instead of being hidden.
+20. **③-sourced candidates need 100 MovieLens ratings** (`CANDIDATE_COLLAB_MIN_RATINGS`). ③'s top unseen predictions were dominated by films with 5–20 ratings from self-selected fans (a 5-rating DC animated TV cut, a Pink Floyd concert): 36 of 59 had < 50 ratings. Weighted-λ regularization doesn't shrink thin items harder, so their biases are noisy. The floor applies only to the candidate *source*; ③ still scores any pool film with ≥ 5 ratings.
+21. **MMR rescales relevance within its pool.** Scores are percentiles over ~1,500 films, so the top 180 all sit in 0.95–1.0 and the similarity penalty (up to 0.3) swamped them: MMR was ranking by novelty and put a K-pop concert film at #2. Relevance is min-max rescaled over the pool MMR considers before applying λ.
+22. **Shorts are hidden** (`RECOMMEND_MIN_RUNTIME=40` minutes) unless they're on your watchlist. MovieLens users rate some classic shorts very highly (*Rabbit of Seville*), and they crowded the top.
 
 ## Open items / known issues
 
@@ -56,19 +72,18 @@ These are deliberate, so don't "fix" them back without reason.
 - [ ] Optional: a configurable default minimum rating for recommendations.
 - [ ] Weak picks: score ① now helps demote them (it's nearly independent of ②: Spearman 0.11 over the real 717-film pool). *Mission to Mars* is no longer in the pool, so that example can't be re-checked. M6's quality floor is the real fix.
 - [ ] Score ① values are small with 126 ratings and `SHRINKAGE_K=3` (top directors ≈ +0.3★). That's fine for ranking, since percentiles are used, but revisit k once M6's holdout metrics exist.
-- [ ] **Stale candidates are never pruned.** The `candidate` table and the vector index only grow. After uploading an export whose top-rated films differ (e.g. someone else's ZIP), films found through the old seeds can still be recommended. Scores ① and ② rank them down, but they should be dropped: remove candidates whose sources no longer include a current seed (keeping the watchlist), and remove them from the index too. There's one profile per app; a new ZIP replaces the old films (`sync_export` deletes missing ones) and match decisions carry over by `title|year`.
+- [x] ~~Stale candidates are never pruned~~: fixed along with full replacement on account change (decision 15).
+- [x] ~~Use ml-32m for real data~~: done in `.env`. The default stays ml-latest-small (what the spec asks for in development). With ml-32m, 101 of 126 rated films and 84% of the pool get ③; 80/20 RMSE 0.48 vs 0.69 for your mean.
+- [ ] **The learned blend is almost all ③ (M6 finding, real data).** Cross-fitted on 126 ratings: ③ alone RMSE 0.454 / Spearman 0.71 (101 films), ① 0.641 / 0.34, ② 0.677 / 0.02, your mean 0.675, fixed weights 0.621 / 0.39, learned blend 0.472 / 0.62. The full model's weights are ③ 2.7★, ① 0, ② 0, votes 0.04; the partial model uses ① (0.58★). So ② barely predicts *how you rate* films you chose to watch (it's more about *what* you watch: a selection effect the rating target can't see), and the top of the list is acclaimed canon. Options: a floor on ②'s weight, a popularity de-bias for ③, or M8's adventurousness slider. The review-query idea for ② (below) is untested.
+- [ ] Some MovieLens links point at stale TMDB ids (25 "not found" enrichment errors from ③-sourced candidates per run). Harmless, but they log at ERROR and are retried each run.
 - [ ] A harmless joblib/loky "leaked semaphore" warning appears when the server is killed after a pipeline run.
 
 ## Plan for remaining milestones
 
-### M5: MovieLens + score ③
-- Download `ml-latest-small` (configurable `ml-32m`) into `backend/data/movielens/`, then map `links.csv` movieId → tmdbId.
-- Add the user as a new row, then run explicit matrix factorization (ALS or SVD in numpy/scipy) with bias terms.
-- Predict ratings for candidates. Candidates not in MovieLens get a null score, and the blend re-weights the other two scores.
-- Add a `make train` target.
-
 ### M6: Blending, OMDb, MMR, metrics
-- Add `/discover/movie` as another candidate source.
+_Done: everything below except the review-query idea, which is still open (keep it only if it beats the metrics above)._
+- Add `/discover/movie` as another candidate source. Also consider score ③ as a source: the top predicted MovieLens films you haven't seen (they need TMDB enrichment and embedding like any candidate).
+- Holdout for ③ is cheap: fold the user in on the 80% (decision 13), no retraining.
 - OMDb only for the final shortlist, via the IMDb id from `external_ids`. `CachedHttpClient` already supports `daily_limit=1000`.
 - Hold out 20%, compute ①②③ using the other 80%, then fit Ridge regression (+ optional log vote count) with 5-fold CV. With fewer than 50 ratings, use fixed weights 0.3/0.4/0.3.
 - Add the watchlist boost, the quality floor (RT ≥ 60 or IMDb ≥ 6.5), and MMR (λ≈0.7) on the embeddings.

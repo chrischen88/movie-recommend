@@ -189,6 +189,10 @@ class CachedHttpClient:
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
         self.daily_limit = daily_limit
+        # Requests that passed the budget check but haven't been cached yet.
+        # Without this, parallel workers could all pass the check at once.
+        self._budget_lock = threading.Lock()
+        self._in_flight = 0
         self._sleep = sleep
         self.limiter = RateLimiter(rate_per_second, sleep=sleep)
         self.network_calls = 0
@@ -202,15 +206,24 @@ class CachedHttpClient:
     def close(self) -> None:
         self._http.close()
 
-    def _check_budget(self) -> None:
+    def _reserve_budget(self) -> bool:
+        """Claim one request from today's budget; True if a claim was made (the
+        caller must `_release_budget` once the response is cached or failed)."""
         if self.daily_limit is None:
-            return
+            return False
         start_of_day = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-        used = self.cache.count_created_since(self.namespace, start_of_day)
-        if used >= self.daily_limit:
-            raise DailyBudgetExceeded(
-                f"{self.namespace}: daily request budget of {self.daily_limit} reached"
-            )
+        with self._budget_lock:
+            used = self.cache.count_created_since(self.namespace, start_of_day) + self._in_flight
+            if used >= self.daily_limit:
+                raise DailyBudgetExceeded(
+                    f"{self.namespace}: daily request budget of {self.daily_limit} reached"
+                )
+            self._in_flight += 1
+        return True
+
+    def _release_budget(self) -> None:
+        with self._budget_lock:
+            self._in_flight -= 1
 
     def _backoff(self, attempt: int, retry_after: str | None) -> float:
         if retry_after:
@@ -238,7 +251,30 @@ class CachedHttpClient:
             if cached is not None:
                 return cached.body if cached.status_code != 404 else None
 
-        self._check_budget()
+        claim = [self._reserve_budget()]  # [still holding a budget reservation?]
+        try:
+            return self._fetch(endpoint, params, ttl, claim)
+        finally:
+            if claim[0]:
+                self._release_budget()
+
+    def _store(
+        self, endpoint: str, params: dict[str, Any], status: int, body: JsonBody | None,
+        ttl: int | None, claim: list[bool],
+    ) -> None:
+        """Cache a response. With a budget, the cached row replaces the in-flight
+        reservation atomically, so the request is never counted twice or not at all."""
+        if not claim[0]:
+            self.cache.set(self.namespace, endpoint, params, status, body, ttl)
+            return
+        with self._budget_lock:
+            self.cache.set(self.namespace, endpoint, params, status, body, ttl)
+            self._in_flight -= 1
+            claim[0] = False
+
+    def _fetch(
+        self, endpoint: str, params: dict[str, Any], ttl: int | None, claim: list[bool]
+    ) -> JsonBody | None:
         last_error: str = "unknown error"
         for attempt in range(self.max_retries + 1):
             self.limiter.acquire()
@@ -251,11 +287,11 @@ class CachedHttpClient:
             else:
                 if resp.status_code == 200:
                     body = resp.json()
-                    self.cache.set(self.namespace, endpoint, params, 200, body, ttl)
+                    self._store(endpoint, params, 200, body, ttl, claim)
                     return body
                 if resp.status_code == 404:
                     log.info("%s %s -> 404 (cached as missing)", self.namespace, endpoint)
-                    self.cache.set(self.namespace, endpoint, params, 404, None, ttl)
+                    self._store(endpoint, params, 404, None, ttl, claim)
                     return None
                 if resp.status_code not in RETRYABLE_STATUS:
                     raise ApiError(

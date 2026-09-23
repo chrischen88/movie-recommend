@@ -10,8 +10,10 @@ const STAGE_LABELS: Record<string, string> = {
   enrichment: "Fetching metadata",
   candidates: "Finding candidate films",
   embedding: "Embedding films",
+  collab: "Training on MovieLens",
   taste: "Building your taste profile",
-  training: "Training",
+  blend: "Learning how to weigh the scores",
+  omdb: "Fetching IMDb / Rotten Tomatoes ratings",
 };
 
 export default function UploadPage() {
@@ -217,6 +219,13 @@ function RunPanel({ out, onResume }: { out: RunOut; onResume: () => void }) {
             </button>
           )}
         </div>
+      )}
+
+      {run.stats.reset && (
+        <p className="rounded-md border border-sky-800 bg-sky-950/40 px-3 py-2 text-sm text-sky-200">
+          This export is from a different account{run.stats.account ? ` (${run.stats.account})` : ""}, so it
+          replaced all previous films, match fixes and recommendations instead of merging with them.
+        </p>
       )}
 
       {run.status === "done" && (

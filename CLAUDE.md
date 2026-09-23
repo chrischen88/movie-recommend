@@ -11,6 +11,7 @@ Local app that recommends films from a Letterboxd export by blending a taste-pro
 - `cd frontend && npm run build`: TypeScript check + build
 - `make serve`: API on :8000 and the UI on :5173 (the user runs this; see below)
 - `make ingest EXPORT=path.zip`, `make build-index`: CLI pipeline
+- `make train` (`FORCE=1` to retrain): download MovieLens if needed and train the score ③ model
 
 ## Conventions
 

@@ -9,7 +9,7 @@ from app.letterboxd import (
     parse_rating,
     parse_year,
 )
-from tests.fixtures.sample_export import ROOT, build_zip
+from tests.fixtures.sample_export import ROOT, build_files, build_zip
 
 
 @pytest.fixture
@@ -167,3 +167,21 @@ def test_content_hash_tracks_rating(export) -> None:
     before = film.content_hash()
     film.rating = 3.0
     assert film.content_hash() != before
+
+
+def test_username_from_profile(sample_zip: bytes) -> None:
+    export = parse_export(sample_zip)
+    assert export.username == "sampleuser"
+    assert "profile.csv" not in export.files_found  # identifies the account; not a film source
+
+
+def test_username_is_normalized() -> None:
+    assert parse_export(build_zip(build_files(username="  SampleUser "))).username == "sampleuser"
+
+
+def test_username_missing() -> None:
+    files = build_files()
+    del files[f"{ROOT}/profile.csv"]
+    assert parse_export(build_zip(files)).username is None
+    files[f"{ROOT}/profile.csv"] = b"Date Joined,Given Name\n2020-01-01,Sam\n"
+    assert parse_export(build_zip(files)).username is None

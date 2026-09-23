@@ -47,6 +47,19 @@ class FakeTmdb:
         ]
         return {"page": 1, "results": results, "total_results": len(results)}
 
+    def _discover(self, params: httpx.QueryParams) -> dict[str, Any]:
+        """Every film has genres Drama + Science Fiction (see _details), so the genre
+        filter matches all; language and vote filters are applied; 20 per page."""
+        min_votes = int(params.get("vote_count.gte", 0))
+        lang = params.get("with_original_language")
+        pool = [
+            m for m in self.movies.values()
+            if m["vote_count"] >= min_votes and (lang is None or m.get("original_language", "en") == lang)
+        ]
+        pool.sort(key=lambda m: (-m["vote_average"], m["id"]))
+        page = int(params.get("page", 1))
+        return {"page": page, "results": pool[(page - 1) * 20 : page * 20], "total_pages": len(pool) // 20 + 1}
+
     def _details(self, m: dict[str, Any]) -> dict[str, Any]:
         tid = m["id"]
         return {
@@ -74,6 +87,10 @@ class FakeTmdb:
         path = request.url.path.removeprefix("/3")
         if path == "/search/movie":
             return httpx.Response(200, json=self._search(request.url.params))
+        if path == "/genre/movie/list":
+            return httpx.Response(200, json={"genres": [{"id": 18, "name": "Drama"}, {"id": 878, "name": "Science Fiction"}]})
+        if path == "/discover/movie":
+            return httpx.Response(200, json=self._discover(request.url.params))
         parts = path.strip("/").split("/")
         if parts[0] == "movie" and parts[1].isdigit():
             tid = int(parts[1])

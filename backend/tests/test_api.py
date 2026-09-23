@@ -1,25 +1,30 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
-from sqlmodel import Session
+from sqlmodel import Session, select
 
-from app.db import get_session
+from app.db import UserFilm, get_session, make_engine
 from app.main import app
 from app.pipeline import get_pipeline
+from app.recommend import current_film_ids
+from tests.fake_movielens import write_fake_movielens
+from tests.fake_omdb import FakeOmdb
 from tests.fake_tmdb import FakeTmdb, movie
-from tests.test_pipeline import fake_for_sample, make_pipeline
+from tests.fixtures.sample_export import WATCHED, build_files, build_zip
+from tests.test_pipeline import SAMPLE_TMDB, fake_for_sample, make_pipeline
 
 
-def make_client(engine: Engine, fake: FakeTmdb | None) -> TestClient:
+def make_client(engine: Engine, fake: FakeTmdb | None, omdb: FakeOmdb | None = None) -> TestClient:
     def _session() -> Iterator[Session]:
         with Session(engine) as s:
             yield s
 
-    pipeline = make_pipeline(engine, fake)
+    pipeline = make_pipeline(engine, fake, omdb=omdb)
     app.dependency_overrides[get_session] = _session
     app.dependency_overrides[get_pipeline] = lambda: pipeline
     return TestClient(app)
@@ -61,7 +66,7 @@ def test_upload_runs_pipeline(client: TestClient, sample_zip: bytes) -> None:
 
     # TestClient runs background tasks before returning.
     out = client.get(f"/api/ingest/{body['run_id']}").json()
-    assert out["stages"] == ["parsing", "matching", "enrichment", "candidates", "embedding", "taste"]
+    assert out["stages"] == ["parsing", "matching", "enrichment", "collab", "candidates", "embedding", "taste", "blend", "omdb"]
     assert out["run"]["status"] == "done"
     assert out["run"]["stats"]["matching"]["matched"] == 34
     assert client.get("/api/ingest/latest").json()["run"]["id"] == body["run_id"]
@@ -134,13 +139,20 @@ def test_recommendations(client: TestClient, sample_zip: bytes) -> None:
     assert past_lives["in_watchlist"] and past_lives["candidate_sources"]
 
     scores = [i["score"] for i in items]
-    assert scores == sorted(scores, reverse=True)
+    assert items[0]["score"] == max(scores)  # MMR reorders for variety, but always starts at the top
     assert all(0.0 <= s <= 1.0 for s in scores)
     assert all(i["source_label"] for i in items)
-    # Score ① is present, and the displayed score is the mean of ① and ② until M6.
     assert max(i["profile_score"] for i in items) == 1.0
-    for i in items:
-        assert i["score"] == pytest.approx((i["profile_score"] + i["embedding_score"]) / 2)
+    # 28 ratings < 50: fixed weights 0.3/0.4/0.3, re-weighted without ③; the score is
+    # the percentile of that blend over the pool (+ a boost for watchlist films).
+    assert body["blend_mode"] == "fixed"
+    plain = [i for i in items if not i["in_watchlist"]]
+    blend = {i["tmdb_id"]: (0.3 * i["profile_score"] + 0.4 * i["embedding_score"]) / 0.7 for i in plain}
+    for a in plain:
+        for b in plain:
+            if blend[a["tmdb_id"]] > blend[b["tmdb_id"]] + 1e-9:
+                assert a["score"] >= b["score"]
+    assert all(i["predicted_rating"] is None for i in items)  # no learned model in fixed mode
     reasons = [r for i in items for r in i["profile_reasons"]]
     assert reasons and all({"label", "stars", "n", "contribution"} <= r.keys() for r in reasons)
     # Every sample film is Drama/Sci-Fi, so those carry no signal and aren't shown.
@@ -149,6 +161,26 @@ def test_recommendations(client: TestClient, sample_zip: bytes) -> None:
     assert not any(r["label"].startswith("Genre ") for r in reasons)
 
     assert len(client.get("/api/recommendations", params={"limit": 3}).json()["items"]) == 3
+
+
+def test_recommendations_with_collab(client: TestClient, sample_zip: bytes, tmp_path: Path) -> None:
+    write_fake_movielens(tmp_path / "movielens" / "ml-latest-small", SAMPLE_TMDB)
+    upload(client, sample_zip)
+    body = client.get("/api/recommendations", params={"limit": 100}).json()
+    assert body["collab_films"] == 28  # every rated sample film is in the fake MovieLens
+    items = {i["title"]: i for i in body["items"]}
+    contact = items["Contact"]
+    assert contact["collab_score"] is not None and 0.5 <= contact["collab_predicted"] <= 5.0
+    chungking = items["Chungking Express"]  # not in MovieLens: ③ is null and the blend uses ① and ②
+    assert chungking["collab_score"] is None and chungking["collab_predicted"] is None
+    assert 0.0 <= chungking["score"] <= 1.0
+
+
+def test_recommendations_without_collab_model(client: TestClient, sample_zip: bytes) -> None:
+    upload(client, sample_zip)
+    body = client.get("/api/recommendations").json()
+    assert body["ready"] and body["collab_films"] is None
+    assert all(i["collab_score"] is None for i in body["items"])
 
 
 def test_taste_endpoint(client: TestClient, sample_zip: bytes) -> None:
@@ -190,3 +222,95 @@ def test_recommendation_filters(client: TestClient, sample_zip: bytes) -> None:
     assert len(client.get("/api/recommendations", params={"limit": 2, "min_rating": 7.5}).json()["items"]) == 2
 
     assert client.get("/api/recommendations", params={"min_rating": 11}).status_code == 422
+
+
+def _snapshot(c: TestClient) -> dict[str, object]:
+    films = sorted(
+        (f["film_key"], f["tmdb_id"], f["match_status"], f["rating"], f["watched"])
+        for f in c.get("/api/films").json()
+    )
+    recs = c.get("/api/recommendations", params={"limit": 200}).json()
+    taste = c.get("/api/taste").json()
+    return {
+        "films": films,
+        "recs": [(i["tmdb_id"], round(i["score"], 9), i["candidate_sources"]) for i in recs["items"]],
+        "total": recs["total"],
+        "taste": (taste["n_rated"], [(cl["label"], cl["size"]) for cl in taste["clusters"]]),
+    }
+
+
+def test_other_account_upload_equals_fresh_install(engine: Engine, tmp_path: Path, sample_zip: bytes) -> None:
+    """Uploading someone else's export leaves exactly the state a fresh install
+    would have after uploading it: nothing from the previous account survives."""
+    other_zip = build_zip(build_files(username="someoneelse", watched=WATCHED[:12]))
+
+    (tmp_path / "fresh").mkdir()
+    fresh_engine = make_engine(tmp_path / "fresh" / "db.sqlite3")
+    def tmdb() -> FakeTmdb:
+        fake = fake_for_sample()
+        fake.movies[777] = movie(777, "Some Home Video", 2004)  # target of the manual fix below
+        return fake
+
+    with make_client(fresh_engine, tmdb()) as fresh:
+        upload(fresh, other_zip)
+        expected = _snapshot(fresh)
+    app.dependency_overrides.clear()
+
+    with make_client(engine, tmdb()) as c:
+        upload(c, sample_zip)
+        arrival = next(f for f in c.get("/api/films").json() if f["name"] == "Arrival")  # in both exports
+        fixed = c.post("/api/matches/set", json={"film_key": arrival["film_key"], "tmdb_ref": "777"}).json()
+        assert fixed["status"] == "manual"
+
+        body = upload(c, other_zip)
+        assert body["stats"]["reset"] is True
+        assert _snapshot(c) == expected
+    app.dependency_overrides.clear()
+
+
+def test_every_eligible_film_is_scored(client: TestClient, engine: Engine, sample_zip: bytes) -> None:
+    """No nearest-neighbour cutoff: every unseen candidate or watchlist film gets
+    a score, however far it is from the taste vectors."""
+    upload(client, sample_zip)
+    with Session(engine) as s:
+        eligible = current_film_ids(s) - {f.tmdb_id for f in s.exec(select(UserFilm)) if f.watched}
+    body = client.get("/api/recommendations", params={"limit": 200}).json()
+    assert body["total"] == len(eligible) > 0
+    assert {i["tmdb_id"] for i in body["items"]} == eligible
+
+
+def test_omdb_ratings_and_filters(engine: Engine, sample_zip: bytes) -> None:
+    with make_client(engine, fake_for_sample(), FakeOmdb()) as c:
+        upload(c, sample_zip)
+        items = c.get("/api/recommendations", params={"limit": 200}).json()["items"]
+        assert all(i["imdb_rating"] is not None for i in items)  # the whole small pool is the shortlist
+        assert any(i["rt_score"] is None for i in items) and any(i["metacritic"] is None for i in items)
+
+        def ids(**params: object) -> set[int]:
+            body = c.get("/api/recommendations", params={"limit": 200, **params})
+            assert body.status_code == 200, body.text
+            return {i["tmdb_id"] for i in body.json()["items"]}
+
+        by_id = {i["tmdb_id"]: i for i in items}
+        assert ids(rating_source="rt", min_rating=60) == {
+            t for t, i in by_id.items() if i["rt_score"] is not None and i["rt_score"] >= 60}
+        assert ids(rating_source="imdb", min_rating=8) == {
+            t for t, i in by_id.items() if i["imdb_rating"] >= 8}
+        assert ids(hide_low_quality=True) == {
+            t for t, i in by_id.items() if (i["rt_score"] or 0) >= 60 or i["imdb_rating"] >= 6.5}
+        assert c.get("/api/recommendations", params={"min_rating": 50}).status_code == 422  # TMDB is 0–10
+        assert c.get("/api/recommendations", params={"rating_source": "letterboxd"}).status_code == 422
+    app.dependency_overrides.clear()
+
+
+def test_metrics(client: TestClient, sample_zip: bytes) -> None:
+    assert client.get("/api/metrics").json()["ready"] is False
+    upload(client, sample_zip)
+    m = client.get("/api/metrics").json()
+    assert m["ready"] and m["mode"] == "fixed" and m["n_ratings"] == 28  # < 50: fixed weights
+    assert m["fixed_weights"] == {"profile": 0.3, "embedding": 0.4, "collab": 0.3}
+    assert {"baseline_mean", "profile", "embedding", "fixed_blend", "learned_blend"} <= m["metrics"].keys()
+    assert all(v["rmse"] > 0 for v in m["metrics"].values())
+    assert m["partial"]["features"] == ["profile", "embedding", "votes"]
+    assert m["collab_model"] is None and m["omdb"]["enabled"] is False
+    assert m["candidates"]["total"] > 0 and sum(m["candidates"]["by_source"].values()) > 0

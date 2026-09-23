@@ -26,8 +26,9 @@ ingest:
 build-index:
 	cd backend && .venv/bin/python -m app.cli build-index
 
+# MovieLens collaborative model (score ③). FORCE=1 retrains even if current.
 train:
-	@echo "train: arrives in milestones 5-6 (collaborative filtering + blend)"
+	cd backend && .venv/bin/python -m app.cli train $(if $(FORCE),--force,)
 
 serve-api:
 	cd backend && .venv/bin/uvicorn app.main:app --reload --port 8000
