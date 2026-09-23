@@ -12,6 +12,10 @@ from app.ingest import sync_export
 from app.letterboxd import make_film_key, parse_export
 from app.pipeline import Pipeline, TmdbUnavailable
 from app.tmdb import TmdbClient
+from pathlib import Path
+
+from app.vectorstore import InMemoryStore
+from tests.fake_embedder import HashEmbedder
 from tests.fake_tmdb import FakeTmdb, movie
 from tests.fixtures.sample_export import WATCHED, WATCHLIST, build_zip
 
@@ -27,12 +31,22 @@ def fake_for_sample() -> FakeTmdb:
         if name == "Heat":
             y = 1996  # TMDB disagrees by a year -> found via ±1 retry
         movies.append(movie(i, name, y))
+    # Films the user hasn't seen: only reachable through recommendations/similar.
+    movies += [
+        movie(501, "Contact", 1997, vote_average=7.4),
+        movie(502, "Solaris", 1972, vote_average=8.0, original_language="ru"),
+        movie(503, "Enemy", 2013, vote_average=6.9),
+        movie(504, "Annihilation", 2018, vote_average=6.4),
+        movie(505, "Chungking Express", 1994, vote_average=8.1, original_language="cn"),
+        movie(506, "Obscure Short", 2020, votes=3),  # below candidate_min_votes
+    ]
     return FakeTmdb(movies)
 
 
-def test_settings() -> Settings:
+def test_settings(data_dir: Path | None = None) -> Settings:
     return Settings(  # type: ignore[call-arg]
         _env_file=None,
+        data_dir=data_dir or Path("."),
         tmdb_api_key="k",
         tmdb_requests_per_second=1000,
         http_max_retries=1,
@@ -43,10 +57,23 @@ def test_settings() -> Settings:
 test_settings.__test__ = False  # type: ignore[attr-defined]
 
 
-def make_pipeline(engine: Engine, fake: FakeTmdb | None) -> Pipeline:
-    s = test_settings()
+def make_pipeline(
+    engine: Engine,
+    fake: FakeTmdb | None,
+    embedder: HashEmbedder | None = None,
+    store: InMemoryStore | None = None,
+) -> Pipeline:
+    # Keep taste_model.json next to the test DB (a tmp dir).
+    s = test_settings(Path(str(engine.url.database)).parent)
     tmdb = TmdbClient("k", ResponseCache(engine), s, transport=fake.transport) if fake else None
-    return Pipeline(engine, s, tmdb, max_workers=4)
+    return Pipeline(
+        engine,
+        s,
+        tmdb,
+        embedder=embedder or HashEmbedder(),
+        store=store if store is not None else InMemoryStore(),
+        max_workers=4,
+    )
 
 
 def run(p: Pipeline, engine: Engine) -> IngestRun:
@@ -83,14 +110,14 @@ def test_full_run(ingested: Engine) -> None:
     assert r.status == "done" and r.stage == "done"
     assert r.stats["matching"] == {"matched": 34, "low_confidence": 0, "unmatched": 1, "error": 0}
     assert r.stats["enrichment"]["enriched"] == 34
-    assert r.progress_done == r.progress_total == 34
 
     st = statuses(ingested)
     assert st["Home Movie Night"] == matching.UNMATCHED
     with Session(ingested) as s:
         heat = s.get(UserFilm, make_film_key("Heat", 1995))
         assert heat and heat.match_confidence == pytest.approx(0.9)
-        assert len(s.exec(select(Movie)).all()) == 34
+        # 34 user films + 5 candidates (the 3-vote "Obscure Short" is filtered out)
+        assert len(s.exec(select(Movie)).all()) == 39
 
 
 def test_second_run_makes_no_requests(ingested: Engine) -> None:
@@ -119,8 +146,10 @@ def test_new_film_in_later_export_only_processes_that_film(ingested: Engine) -> 
         sync_export(s, parse_export(build_zip(files)))
     r = run(p, ingested)
     assert r.stats["matching"]["matched"] == 1
-    assert r.stats["enrichment"]["enriched"] == 1
-    assert len(fake.requests) - n == 3  # search + details + reviews
+    # Anora was already fetched as a candidate in the first run: no refetch.
+    assert r.stats["enrichment"] == {"enriched": 0, "not_found": 0, "errors": 0, "already_had": 35}
+    # Only: search for Anora + its recommendations/similar lists as a new 4.5★ seed.
+    assert len(fake.requests) - n == 3
 
 
 def test_missing_key_skips_gracefully(ingested: Engine) -> None:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -58,10 +59,25 @@ class Settings(BaseSettings):
     # --- MovieLens ---
     movielens_dataset: str = "ml-latest-small"  # or "ml-32m"
 
-    # --- Embeddings ---
+    # --- Candidate generation ---
+    candidate_seed_count: int = 25  # top-rated films used as recommendation seeds
+    candidate_seed_min_rating: float = 4.0
+    candidate_min_votes: int = 50  # skip obscure TMDB entries with too few votes
+
+    # --- Embeddings / vector DB ---
     embedding_model: str = "BAAI/bge-small-en-v1.5"
+    embedding_batch_size: int = 64
+    vector_collection: str = "movies"
+    vector_query_k: int = 300  # neighbours fetched per taste vector / cluster centroid
     taste_cluster_min_rating: float = 4.0
     taste_cluster_k_range: tuple[int, int] = (3, 6)
+    # A k is only eligible if every cluster has at least this many films, so a
+    # single stray favourite can't become its own "taste" and flood the results.
+    taste_cluster_min_size: int = 3
+    doc_max_reviews: int = 2
+    # "zmax": standardize each taste/cluster vector's similarities before taking
+    # the max (see taste.score_embeddings); "max": raw max cosine.
+    embedding_score_mode: Literal["zmax", "max"] = "zmax"
 
     # --- Taste profile (score ①) ---
     shrinkage_k: float = 3.0  # pseudo-count for Bayesian shrinkage toward 0
@@ -99,6 +115,10 @@ class Settings(BaseSettings):
     @property
     def chroma_path(self) -> Path:
         return self.data_dir / self.chroma_dirname
+
+    @property
+    def taste_model_path(self) -> Path:
+        return self.data_dir / "taste_model.json"
 
 
 @lru_cache

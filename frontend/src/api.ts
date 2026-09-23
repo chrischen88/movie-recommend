@@ -66,6 +66,68 @@ export interface MatchesResponse {
   rows: MatchRow[];
 }
 
+export interface Recommendation {
+  tmdb_id: number;
+  title: string;
+  year: number | null;
+  directors: string[];
+  genres: string[];
+  poster_path: string | null;
+  overview: string | null;
+  runtime: number | null;
+  vote_average: number | null;
+  vote_count: number | null;
+  original_language: string | null;
+  in_watchlist: boolean;
+  score: number;
+  embedding_score: number;
+  similarity: number;
+  source: string;
+  source_label: string;
+  candidate_sources: string[];
+}
+
+export interface Facets {
+  genres: Record<string, number>;
+  decades: Record<string, number>;
+  languages: Record<string, number>;
+}
+
+export interface RecommendationsResponse {
+  ready: boolean;
+  message: string | null;
+  items: Recommendation[];
+  total?: number;
+  matching?: number;
+  facets?: Facets;
+}
+
+export interface RecFilters {
+  min_rating?: number;
+  genre?: string;
+  decade?: number;
+  max_runtime?: number;
+  language?: string;
+}
+
+export interface TasteCluster {
+  id: number;
+  source: string;
+  label: string;
+  size: number;
+  examples: { tmdb_id: number; title: string; year: number | null; poster_path: string | null }[];
+}
+
+export interface TasteResponse {
+  ready: boolean;
+  message?: string | null;
+  mean_rating?: number;
+  n_rated?: number;
+  silhouette?: number | null;
+  embedding_model?: string;
+  clusters: TasteCluster[];
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(path, init);
   if (!resp.ok) {
@@ -102,6 +164,14 @@ export const api = {
     postJson<MatchRow>("/api/matches/set", { film_key, tmdb_ref }),
   acceptMatch: (film_key: string) => postJson<MatchRow>("/api/matches/accept", { film_key }),
   ignoreMatch: (film_key: string) => postJson<MatchRow>("/api/matches/ignore", { film_key }),
+  recommendations: (limit = 60, filters: RecFilters = {}) => {
+    const qs = new URLSearchParams({ limit: String(limit) });
+    for (const [k, v] of Object.entries(filters)) {
+      if (v !== undefined && v !== "") qs.set(k, String(v));
+    }
+    return request<RecommendationsResponse>(`/api/recommendations?${qs}`);
+  },
+  taste: () => request<TasteResponse>("/api/taste"),
 };
 
 export const posterUrl = (path: string | null, size: "w92" | "w185" | "w342" = "w92") =>

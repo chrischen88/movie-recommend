@@ -8,7 +8,9 @@ const STAGE_LABELS: Record<string, string> = {
   parsing: "Parsing export",
   matching: "Matching to TMDB",
   enrichment: "Fetching metadata",
-  embedding: "Embedding",
+  candidates: "Finding candidate films",
+  embedding: "Embedding films",
+  taste: "Building your taste profile",
   training: "Training",
 };
 
@@ -211,7 +213,7 @@ function RunPanel({ out, onResume }: { out: RunOut; onResume: () => void }) {
           {run.message}
           {run.status !== "running" && (
             <button onClick={onResume} className="ml-3 underline hover:text-white">
-              Retry matching
+              Run processing again
             </button>
           )}
         </div>
@@ -231,6 +233,15 @@ function RunPanel({ out, onResume }: { out: RunOut; onResume: () => void }) {
             }
           />
         </div>
+      )}
+
+      {run.status === "done" && (
+        <Link
+          to="/recommendations"
+          className="mr-3 inline-block rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium hover:bg-emerald-500"
+        >
+          See recommendations →
+        </Link>
       )}
 
       {run.status === "done" && needsReview > 0 && (

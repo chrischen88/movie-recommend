@@ -61,7 +61,7 @@ def test_upload_runs_pipeline(client: TestClient, sample_zip: bytes) -> None:
 
     # TestClient runs background tasks before returning.
     out = client.get(f"/api/ingest/{body['run_id']}").json()
-    assert out["stages"] == ["parsing", "matching", "enrichment"]
+    assert out["stages"] == ["parsing", "matching", "enrichment", "candidates", "embedding", "taste"]
     assert out["run"]["status"] == "done"
     assert out["run"]["stats"]["matching"]["matched"] == 34
     assert client.get("/api/ingest/latest").json()["run"]["id"] == body["run_id"]
@@ -114,3 +114,69 @@ def test_match_review_flow(client: TestClient, sample_zip: bytes) -> None:
     assert no_candidate.status_code == 400
     accepted = client.post("/api/matches/accept", json={"film_key": arrival["film_key"]}).json()
     assert accepted["status"] == "manual" and accepted["confidence"] == 1.0
+
+
+def test_recommendations(client: TestClient, sample_zip: bytes) -> None:
+    before = client.get("/api/recommendations").json()
+    assert before["ready"] is False and "taste model" in before["message"]
+
+    upload(client, sample_zip)
+    body = client.get("/api/recommendations", params={"limit": 100}).json()
+    assert body["ready"] is True
+    items = body["items"]
+    titles = {i["title"] for i in items}
+
+    watched = {f["tmdb_id"] for f in client.get("/api/films").json() if f["watched"]}
+    assert not watched & {i["tmdb_id"] for i in items}
+    assert {"Contact", "Solaris", "Enemy", "Annihilation", "Chungking Express"} <= titles
+    assert "Obscure Short" not in titles  # filtered by candidate_min_votes
+    past_lives = next(i for i in items if i["title"] == "Past Lives")
+    assert past_lives["in_watchlist"] and past_lives["candidate_sources"]
+
+    scores = [i["score"] for i in items]
+    assert scores == sorted(scores, reverse=True)
+    assert all(0.0 <= s <= 1.0 for s in scores) and scores[0] == 1.0
+    assert all(i["source_label"] for i in items)
+
+    assert len(client.get("/api/recommendations", params={"limit": 3}).json()["items"]) == 3
+
+
+def test_taste_endpoint(client: TestClient, sample_zip: bytes) -> None:
+    assert client.get("/api/taste").json()["ready"] is False
+    upload(client, sample_zip)
+    taste = client.get("/api/taste").json()
+    assert taste["ready"] and taste["n_rated"] == 28  # every rated film matched
+    # The fake hash embedder has little cluster structure; whatever k-means
+    # finds must respect the minimum cluster size.
+    assert len(taste["clusters"]) <= 6
+    assert all(c["size"] >= 3 and c["examples"] for c in taste["clusters"])
+
+
+def test_recommendation_filters(client: TestClient, sample_zip: bytes) -> None:
+    upload(client, sample_zip)
+    base = client.get("/api/recommendations", params={"limit": 200}).json()
+    assert base["matching"] == base["total"] == len(base["items"])
+    assert base["facets"]["languages"]["ru"] == 1 and "Drama" in base["facets"]["genres"]
+
+    def titles(**params: object) -> set[str]:
+        body = client.get("/api/recommendations", params={"limit": 200, **params}).json()
+        assert body["matching"] == len(body["items"]) <= body["total"] == base["total"]
+        return {i["title"] for i in body["items"]}
+
+    high = titles(min_rating=7.5)
+    assert {"Solaris", "Chungking Express"} <= high
+    assert not {"Contact", "Enemy", "Annihilation"} & high
+    assert titles(language="ru") == {"Solaris"}
+    assert titles(decade=1990, min_rating=8) == {"Chungking Express"}
+    assert "Solaris" in titles(genre=["Horror", "Drama"])
+    assert titles(genre=["Western"]) == set()
+
+    # Scores don't change under filtering: they're ranks over the whole pool.
+    by_id = {i["tmdb_id"]: i["score"] for i in base["items"]}
+    filtered = client.get("/api/recommendations", params={"min_rating": 7.5}).json()["items"]
+    assert all(by_id[i["tmdb_id"]] == i["score"] for i in filtered)
+
+    # A limit applies after filtering, so strict filters still fill the page.
+    assert len(client.get("/api/recommendations", params={"limit": 2, "min_rating": 7.5}).json()["items"]) == 2
+
+    assert client.get("/api/recommendations", params={"min_rating": 11}).status_code == 422

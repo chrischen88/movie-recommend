@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Annotated, Literal
+from dataclasses import asdict
+from typing import Annotated, Any, Literal
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlmodel import Session, col, select
@@ -16,6 +17,7 @@ from app.db import IngestRun, Movie, UserFilm, get_session, utcnow
 from app.ingest import sync_export
 from app.letterboxd import ExportError, parse_export
 from app.pipeline import STAGES, Pipeline, TmdbUnavailable, get_pipeline
+from app.recommend import RecFilters, recommend
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s"
@@ -108,7 +110,7 @@ async def upload_export(
 def resume_ingest(
     session: SessionDep, pipeline: PipelineDep, background: BackgroundTasks
 ) -> dict[str, int]:
-    """Re-run matching/enrichment on already-ingested films (e.g. after adding a key)."""
+    """Re-run the pipeline on already-ingested films (e.g. after adding a key)."""
     if not pipeline.try_acquire():
         raise HTTPException(409, "an ingestion run is already in progress")
     try:
@@ -251,3 +253,86 @@ def ignore_match(body: FilmKeyIn, session: SessionDep, pipeline: PipelineDep) ->
         raise HTTPException(404, "film not found") from exc
     session.expire_all()
     return _row_for(session, body.film_key)
+
+
+# ---------------------------------------------------------------- recommendations
+
+
+def _not_ready(pipeline: Pipeline) -> str | None:
+    if pipeline.store is None:
+        return "No vector store configured."
+    if pipeline.load_taste() is None:
+        return "No taste model yet: upload an export and let processing finish."
+    return None
+
+
+@app.get("/api/recommendations")
+def get_recommendations(
+    session: SessionDep,
+    pipeline: PipelineDep,
+    limit: int = 40,
+    min_rating: Annotated[float | None, Query(ge=0, le=10)] = None,
+    genre: Annotated[list[str] | None, Query()] = None,
+    decade: Annotated[int | None, Query(ge=1870, le=2100)] = None,
+    max_runtime: Annotated[int | None, Query(gt=0)] = None,
+    language: str | None = None,
+) -> dict[str, Any]:
+    reason = _not_ready(pipeline)
+    model = pipeline.load_taste()
+    if reason or model is None or pipeline.store is None:
+        return {"ready": False, "message": reason, "items": []}
+    filters = RecFilters(
+        min_rating=min_rating,
+        genres=tuple(genre or ()),
+        decade=decade,
+        max_runtime=max_runtime,
+        language=language or None,
+    )
+    result = recommend(
+        session,
+        pipeline.store,
+        model,
+        limit=max(1, min(limit, 200)),
+        k_per_vector=pipeline.settings.vector_query_k,
+        mode=pipeline.settings.embedding_score_mode,
+        filters=filters,
+    )
+    return {
+        "ready": True,
+        "message": None,
+        "items": [asdict(r) for r in result.items],
+        "total": result.total,
+        "matching": result.matching,
+        "facets": asdict(result.facets),
+    }
+
+
+@app.get("/api/taste")
+def get_taste(session: SessionDep, pipeline: PipelineDep) -> dict[str, Any]:
+    model = pipeline.load_taste()
+    if model is None:
+        return {"ready": False, "message": _not_ready(pipeline), "clusters": []}
+    ids = {i for c in model.clusters for i in c.member_ids}
+    movies = {m.tmdb_id: m for m in session.exec(select(Movie).where(col(Movie.tmdb_id).in_(ids)))}
+    return {
+        "ready": True,
+        "mean_rating": model.mean_rating,
+        "n_rated": model.n_rated,
+        "silhouette": model.silhouette,
+        "embedding_model": model.embedding_model,
+        "clusters": [
+            {
+                "id": c.id,
+                "source": c.source,
+                "label": c.label,
+                "size": len(c.member_ids),
+                "examples": [
+                    {"tmdb_id": i, "title": movies[i].title, "year": movies[i].year,
+                     "poster_path": movies[i].poster_path}
+                    for i in c.member_ids[:6]
+                    if i in movies
+                ],
+            }
+            for c in model.clusters
+        ],
+    }

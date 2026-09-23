@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { NavLink, Route, Routes } from "react-router-dom";
 import { api, type Health } from "./api";
 import MatchReviewPage from "./pages/MatchReviewPage";
+import RecommendationsPage from "./pages/RecommendationsPage";
 import UploadPage from "./pages/UploadPage";
 
 const navClass = ({ isActive }: { isActive: boolean }) =>
@@ -20,6 +21,9 @@ export default function App() {
         <div className="mx-auto max-w-6xl px-4 py-3 flex items-center gap-4">
           <span className="font-semibold tracking-tight">Film Picks</span>
           <nav className="flex gap-1">
+            <NavLink to="/recommendations" className={navClass}>
+              Recommendations
+            </NavLink>
             <NavLink to="/" className={navClass} end>
               Upload
             </NavLink>
@@ -48,6 +52,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<UploadPage />} />
           <Route path="/matches" element={<MatchReviewPage />} />
+          <Route path="/recommendations" element={<RecommendationsPage />} />
         </Routes>
       </main>
     </div>

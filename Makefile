@@ -24,7 +24,7 @@ ingest:
 	cd backend && .venv/bin/python -m app.cli ingest $(abspath $(EXPORT))
 
 build-index:
-	@echo "build-index: arrives in milestone 3 (embeddings + Chroma)"
+	cd backend && .venv/bin/python -m app.cli build-index
 
 train:
 	@echo "train: arrives in milestones 5-6 (collaborative filtering + blend)"

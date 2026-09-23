@@ -18,7 +18,7 @@ def movie(
         "original_title": extra.pop("original_title", title),
         "release_date": f"{year}-06-01" if year else "",
         "vote_count": votes,
-        "vote_average": 7.5,
+        "vote_average": extra.pop("vote_average", 7.5),
         "popularity": votes / 100,
         "poster_path": f"/p{tmdb_id}.jpg",
         **extra,
@@ -53,7 +53,7 @@ class FakeTmdb:
             **m,
             "overview": f"Overview of {m['title']}.",
             "runtime": 100 + tid % 60,
-            "original_language": "en",
+            "original_language": m.get("original_language", "en"),
             "genres": [{"id": 18, "name": "Drama"}, {"id": 878, "name": "Science Fiction"}],
             "production_countries": [{"iso_3166_1": "US", "name": "United States of America"}],
             "credits": {
@@ -84,6 +84,14 @@ class FakeTmdb:
                 return httpx.Response(404, json={"status_code": 34})
             if len(parts) == 2:
                 return httpx.Response(200, json=self._details(m))
+            if parts[2] in ("recommendations", "similar"):
+                # Deterministic: every other film, rotated by the seed id.
+                others = sorted(i for i in self.movies if i != tid)
+                if parts[2] == "similar":
+                    others = others[::-1]
+                return httpx.Response(
+                    200, json={"page": 1, "results": [self.movies[i] for i in others[:20]]}
+                )
             if parts[2] == "reviews":
                 return httpx.Response(
                     200,

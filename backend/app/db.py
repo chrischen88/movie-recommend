@@ -82,6 +82,15 @@ class Movie(SQLModel, table=True):
     enriched_at: datetime = Field(default_factory=utcnow)
 
 
+class Candidate(SQLModel, table=True):
+    """A film proposed for recommendation, and where it came from."""
+
+    tmdb_id: int = Field(primary_key=True)
+    # e.g. ["recommendations:329865", "similar:603"]
+    sources: list[str] = Field(default_factory=list, sa_column=Column(JSON))
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
 class IngestRun(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     started_at: datetime = Field(default_factory=utcnow)
