@@ -1,0 +1,11 @@
+.env
+backend/.venv/
+backend/data/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+frontend/node_modules/
+frontend/dist/
+sample_letterboxd_export.zip
+.DS_Store

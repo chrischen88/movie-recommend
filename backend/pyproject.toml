@@ -1,0 +1,24 @@
+[project]
+name = "letterboxd-recommender"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pandas>=2.2",
+    "sqlmodel>=0.0.22",
+    "httpx>=0.27",
+    "pydantic-settings>=2.4",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-timeout>=2.3"]
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 60
+filterwarnings = ["ignore::DeprecationWarning"]
