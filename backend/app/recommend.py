@@ -1,16 +1,19 @@
-"""Recommendation assembly. Milestone 3: embedding similarity (score ②) only;
-later milestones add scores ① and ③, blending, MMR and the LLM layer."""
+"""Recommendation assembly: score ① (taste profile) and score ② (embedding
+similarity), averaged for now. Later milestones add score ③, the learned blend,
+MMR and the LLM layer."""
 
 from __future__ import annotations
 
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
+from collections.abc import Mapping
 from typing import Literal
 
 from sqlmodel import Session, col, select
 
 from app.db import Candidate, Movie, UserFilm
+from app.profile import Contribution, TasteProfile, score_profile
 from app.taste import TasteModel, score_embeddings
 from app.vectorstore import VectorStore
 
@@ -31,12 +34,15 @@ class Recommendation:
     vote_count: int | None
     original_language: str | None
     in_watchlist: bool
-    score: float  # blended score, 0–1 (for now: score ②)
+    score: float  # blended score, 0–1 (for now: mean of ① and ②)
     embedding_score: float  # score ②, percentile-normalized 0–1
     similarity: float  # raw best cosine similarity
     source: str  # "taste" or "cluster:<id>"
     source_label: str
     candidate_sources: list[str] = field(default_factory=list)
+    profile_score: float | None = None  # score ①, percentile-normalized 0–1; None without a profile
+    profile_raw: float | None = None
+    profile_reasons: list[Contribution] = field(default_factory=list)  # strongest first
 
 
 @dataclass(frozen=True)
@@ -126,6 +132,10 @@ def recommend(
     k_per_vector: int = 300,
     mode: Literal["zmax", "max"] = "zmax",
     filters: RecFilters | None = None,
+    profile: TasteProfile | None = None,
+    feature_weights: Mapping[str, float] | None = None,
+    reasons_per_film: int = 5,
+    min_reason_stars: float = 0.05,
 ) -> RecResult:
     filters = filters or RecFilters()
     pool = embedding_pool(store, model, k_per_vector)
@@ -147,6 +157,13 @@ def recommend(
         c.tmdb_id: c.sources
         for c in session.exec(select(Candidate).where(col(Candidate.tmdb_id).in_(scores)))
     }
+    profile_scores = (
+        score_profile(
+            profile, movies.values(), feature_weights or {}, reasons_per_film, min_reason_stars
+        )
+        if profile is not None
+        else {}
+    )
 
     recs: list[Recommendation] = []
     for tid, sc in scores.items():
@@ -154,6 +171,7 @@ def recommend(
         if m is None:
             log.warning("tmdb %s is in the vector index but not the DB; skipped", tid)
             continue
+        ps = profile_scores.get(tid)
         recs.append(
             Recommendation(
                 tmdb_id=tid,
@@ -168,12 +186,15 @@ def recommend(
                 vote_count=m.vote_count,
                 original_language=m.original_language,
                 in_watchlist=tid in watchlist,
-                score=sc.normalized,
+                score=sc.normalized if ps is None else (sc.normalized + ps.normalized) / 2,
                 embedding_score=sc.normalized,
                 similarity=sc.raw,
                 source=sc.source,
                 source_label=model.label_for(sc.source),
                 candidate_sources=provenance.get(tid, ["watchlist"] if tid in watchlist else []),
+                profile_score=None if ps is None else ps.normalized,
+                profile_raw=None if ps is None else ps.raw,
+                profile_reasons=[] if ps is None else ps.contributions,
             )
         )
     # Scores are percentiles over the whole pool, so filtering never changes a

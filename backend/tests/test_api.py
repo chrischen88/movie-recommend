@@ -135,8 +135,18 @@ def test_recommendations(client: TestClient, sample_zip: bytes) -> None:
 
     scores = [i["score"] for i in items]
     assert scores == sorted(scores, reverse=True)
-    assert all(0.0 <= s <= 1.0 for s in scores) and scores[0] == 1.0
+    assert all(0.0 <= s <= 1.0 for s in scores)
     assert all(i["source_label"] for i in items)
+    # Score ① is present, and the displayed score is the mean of ① and ② until M6.
+    assert max(i["profile_score"] for i in items) == 1.0
+    for i in items:
+        assert i["score"] == pytest.approx((i["profile_score"] + i["embedding_score"]) / 2)
+    reasons = [r for i in items for r in i["profile_reasons"]]
+    assert reasons and all({"label", "stars", "n", "contribution"} <= r.keys() for r in reasons)
+    # Every sample film is Drama/Sci-Fi, so those carry no signal and aren't shown.
+    assert all(abs(r["stars"]) >= 0.05 for r in reasons)
+    assert any(r["label"].startswith("Decade ") for r in reasons)
+    assert not any(r["label"].startswith("Genre ") for r in reasons)
 
     assert len(client.get("/api/recommendations", params={"limit": 3}).json()["items"]) == 3
 

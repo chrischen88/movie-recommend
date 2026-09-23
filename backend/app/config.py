@@ -81,6 +81,8 @@ class Settings(BaseSettings):
 
     # --- Taste profile (score ①) ---
     shrinkage_k: float = 3.0  # pseudo-count for Bayesian shrinkage toward 0
+    profile_reasons_per_film: int = 5  # top contributions kept for explanations
+    profile_min_reason_stars: float = 0.05  # hide explanations weaker than this (in ★)
     feature_weights: dict[str, float] = Field(
         default_factory=lambda: {
             "director": 1.0,

@@ -73,10 +73,10 @@ export default function RecommendationsPage() {
       <div>
         <h1 className="text-2xl font-semibold">Recommendations</h1>
         <p className="text-zinc-400 text-sm mt-1">
-          Ranked by embedding similarity to your taste
+          Ranked by the average of your taste profile ① and embedding similarity ②
           {taste?.n_rated ? ` (built from ${taste.n_rated} rated films` : ""}
           {taste?.clusters.length ? `, ${taste.clusters.length} taste clusters)` : taste?.n_rated ? ")" : ""}.
-          Taste-profile and collaborative scores arrive in later milestones.
+          The collaborative score and learned blend arrive in later milestones.
         </p>
       </div>
 
@@ -182,7 +182,31 @@ function RecCard({ rec, rank }: { rec: Recommendation; rank: number }) {
             </p>
           )}
         </div>
+        {rec.profile_score !== null && (
+          <ScoreBar
+            label="① taste profile"
+            value={rec.profile_score}
+            detail={rec.profile_raw !== null ? `raw ${rec.profile_raw.toFixed(2)}` : undefined}
+          />
+        )}
         <ScoreBar label="② similarity" value={rec.embedding_score} detail={`cos ${rec.similarity.toFixed(2)}`} />
+        {rec.profile_reasons.length > 0 && (
+          <ul className="space-y-0.5 text-xs">
+            {rec.profile_reasons.slice(0, 3).map((r) => (
+              <li
+                key={`${r.type}:${r.value}`}
+                className="flex justify-between gap-2"
+                title={`You rate films with this ${r.stars >= 0 ? "above" : "below"} your average (${r.n} rated film${r.n === 1 ? "" : "s"}, shrunk toward 0)`}
+              >
+                <span className="truncate text-zinc-400">{r.label}</span>
+                <span className={`tabular-nums ${r.stars >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                  {r.stars >= 0 ? "+" : "−"}
+                  {Math.abs(r.stars).toFixed(1)}★
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
         <p className="mt-auto text-xs text-zinc-400">
           <span className="text-zinc-500">Matches:</span> {rec.source_label}
         </p>

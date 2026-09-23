@@ -12,13 +12,13 @@ _Last updated: 2026-09-23_
 | 2 | TMDB matching + enrichment, match-review UI | ✅ Done |
 | 3 | Embeddings + Chroma, taste vector/clusters, score ②, basic recs page | ✅ Done |
 | — | Recommendation filters (requested outside the plan) | ✅ Done |
-| 4 | Score ① (taste profile) with explanations | ⏭ Next |
-| 5 | MovieLens ingestion + score ③ | Not started |
+| 4 | Score ① (taste profile) with explanations | ✅ Done |
+| 5 | MovieLens ingestion + score ③ | ⏭ Next |
 | 6 | Candidate gen (discover), OMDb, learned blend, MMR, metrics page | Not started |
 | 7 | OpenAI layer: re-rank, explanations, natural-language requests | Not started |
 | 8 | UI polish, taste profile page, feedback loop, README | Not started |
 
-Tests: 118 passing (`make test`). The frontend type-checks and builds (`cd frontend && npm run build`).
+Tests: 128 passing (`make test`). The frontend type-checks and builds (`cd frontend && npm run build`).
 
 ## What exists (by module)
 
@@ -28,9 +28,10 @@ Tests: 118 passing (`make test`). The frontend type-checks and builds (`cd front
 - `backend/app/tmdb.py`, `matching.py`: TMDB client and title/year matching with confidence scores.
 - `backend/app/pipeline.py`: background run: matching → enrichment → candidates → embedding → taste.
 - `backend/app/embeddings.py`, `vectorstore.py`, `taste.py`: film documents, the `VectorStore` interface (Chroma + in-memory), the taste vector, clusters, and score ②.
-- `backend/app/recommend.py`: builds the ranked list, applies `RecFilters` (min TMDB rating, genre, decade, max runtime, language) and computes facets.
+- `backend/app/profile.py`: score ①. Builds the taste profile (shrunk mean rating deviation per director/genre/actor/keyword/decade/language/country), scores candidates, and keeps the top contributions as explanations. Also `user_ratings()`, which the taste-vector build shares.
+- `backend/app/recommend.py`: builds the ranked list (score = mean of ① and ② until M6), applies `RecFilters` (min TMDB rating, genre, decade, max runtime, language) and computes facets.
 - `backend/app/main.py`: FastAPI. Routes: `/api/health`, `/api/upload`, `/api/ingest/{id|latest|resume}`, `/api/films`, `/api/matches[/set|/accept|/ignore]`, `/api/recommendations`, `/api/taste`.
-- `frontend/`: Upload (progress stepper), Matches (review/fix), and Recommendations (poster grid, filter bar, cluster chips) pages.
+- `frontend/`: Upload (progress stepper), Matches (review/fix), and Recommendations (poster grid, filter bar, cluster chips, ①/② bars, up to 3 "why" lines per card) pages.
 
 ## Decisions & deviations from the spec
 
@@ -44,24 +45,21 @@ These are deliberate, so don't "fix" them back without reason.
 6. **Ambiguous matches** (a near-tie between two films that both have real vote counts) are pushed into review. A same-name obscure film is simply outvoted.
 7. **Collaborative filtering (M5, planned):** use a numpy/scipy implementation, because `implicit` may lack Python 3.13 wheels.
 8. **The DB auto-migrates by adding new columns** (`db._add_missing_columns`), so new model fields don't require deleting the DB.
+9. **Score ① divides each feature type's sum by √(values of that type).** The spec says a plain weighted sum, but TMDB films carry anywhere from 3 to 40+ keywords, and each keyword seen on even one rated film has a nonzero shrunk value. A plain sum lets keyword count swamp the director. The √n scaling keeps multi-valued types comparable while still rewarding several matches.
+10. **Score ① is computed per request, not stored.** It needs only the local `movie` table and takes milliseconds for a few hundred rated films, so it's always in sync with manual match fixes, with no pipeline stage or file to go stale.
+11. **Weak explanations are hidden.** Contributions under `PROFILE_MIN_REASON_STARS` (0.05★) still count toward the score but aren't shown. Features on every rated film (e.g. all Drama) have a zero value by construction; float noise is snapped to 0 so they don't show up as "−0.0★".
 
 ## Open items / known issues
 
 - [ ] **Fold `/reviews` into the details call** (`append_to_response=credits,keywords,external_ids,reviews`). Reviews are currently a separate request per film, so this halves first-run TMDB calls (~1,181 → ~630 on the sample export). Changing the request format changes cache keys, so responses cached under the old format won't be reused.
 - [ ] Gitignore `frontend/tsconfig.tsbuildinfo` (a build artifact) and `git rm --cached` it.
-- [ ] Commit M3 + filters + the proxy-port change. Nothing after the init commit is committed yet.
 - [ ] Optional: a configurable default minimum rating for recommendations.
-- [ ] Weak picks (e.g. *Mission to Mars*) get through while score ② is the only signal. M4 and M6 should fix this.
+- [ ] Weak picks: score ① now helps demote them (it's nearly independent of ②: Spearman 0.11 over the real 717-film pool). *Mission to Mars* is no longer in the pool, so that example can't be re-checked. M6's quality floor is the real fix.
+- [ ] Score ① values are small with 126 ratings and `SHRINKAGE_K=3` (top directors ≈ +0.3★). That's fine for ranking, since percentiles are used, but revisit k once M6's holdout metrics exist.
+- [ ] **Stale candidates are never pruned.** The `candidate` table and the vector index only grow. After uploading an export whose top-rated films differ (e.g. someone else's ZIP), films found through the old seeds can still be recommended. Scores ① and ② rank them down, but they should be dropped: remove candidates whose sources no longer include a current seed (keeping the watchlist), and remove them from the index too. There's one profile per app; a new ZIP replaces the old films (`sync_export` deletes missing ones) and match decisions carry over by `title|year`.
 - [ ] A harmless joblib/loky "leaked semaphore" warning appears when the server is killed after a pipeline run.
 
 ## Plan for remaining milestones
-
-### M4: Score ① (taste profile)
-- New `app/profile.py`: μ = mean rating. For each feature value (director, genre, actor [top 5 cast], keyword, decade, language, country), take the mean of (rating − μ), shrunk toward 0: `sum / (n + SHRINKAGE_K)`.
-- A candidate's score is the sum of `FEATURE_WEIGHTS[type] × value` over its features, converted to a percentile rank from 0 to 1.
-- Keep the top contributions for explanations ("Director Denis Villeneuve: +0.9").
-- Uses only local data (the `movie` table), so no API calls.
-- Show a ① bar and the explanation lines on the cards. Initially the displayed score = mean of ① and ② (the real blend comes in M6).
 
 ### M5: MovieLens + score ③
 - Download `ml-latest-small` (configurable `ml-32m`) into `backend/data/movielens/`, then map `links.csv` movieId → tmdbId.
@@ -76,12 +74,15 @@ These are deliberate, so don't "fix" them back without reason.
 - Add the watchlist boost, the quality floor (RT ≥ 60 or IMDb ≥ 6.5), and MMR (λ≈0.7) on the embeddings.
 - Add a `/api/metrics` endpoint and page (RMSE + Spearman per method and for the blend).
 - Add IMDb/RT/Metacritic to the rating filter.
+- **Review queries for score ② (your own review text).** `UserFilm.review_text` is parsed but unused (the real export has 38 reviews on 128 films, ~156 chars on average). Embed each review, then query the index with it, weighted by (rating − μ) like the taste vector, as one more source in score ②'s z-scored max, e.g. `source="review:<tmdb_id>"`, labelled "Like your review of X". Keep it behind a config flag and a small weight, and keep it only if the holdout metrics improve. **Leakage:** the holdout films' reviews must be excluded while computing the holdout scores. Reviews are opinions while film docs are plot and metadata, so use `embed_query` (from M7) if it lands first.
 
 ### M7: OpenAI layer
 - An `LLMClient` interface. Re-rank the top 30 → 20, returning a one-sentence "why" per film via Structured Outputs.
 - Validate ids, limit moves to ±`LLM_MAX_POSITION_SHIFT`, and fall back to the blended order.
 - Natural-language requests → filters + a query string, embedded with `embed_query` (BGE query prefix) and blended with the taste vector.
 - Cache responses in SQLite by input hash, log tokens, and show cost on the metrics page. Use template explanations if the key is missing or a call fails.
+- **Review aspects → score ①.** Use Structured Outputs to extract liked and disliked aspects from each of the user's reviews (e.g. +"atmospheric", +"strong score", −"slow pacing"). Cache the result per review by hash, so each review costs one call ever. Add these to the profile as an `aspect` feature type with its own weight, getting the same shrinkage as other features. Match candidates via their TMDB keywords and review text (embedding similarity to the aspect phrase above a threshold, or the LLM re-rank step). The holdout exclusion rule from M6 applies here too.
+- **Explanations that quote the user.** Give the re-ranker the most relevant snippet of the user's own review, so it can write "You praised the score in *Whiplash*". Only quote reviews of films that actually drove the match (the matched cluster's members or top ① contributors), so quotes aren't random.
 
 ### M8: Polish and feedback
 - Taste profile page (top/bottom directors/genres/actors, clusters, rating histogram).

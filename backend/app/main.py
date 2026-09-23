@@ -17,6 +17,7 @@ from app.db import IngestRun, Movie, UserFilm, get_session, utcnow
 from app.ingest import sync_export
 from app.letterboxd import ExportError, parse_export
 from app.pipeline import STAGES, Pipeline, TmdbUnavailable, get_pipeline
+from app.profile import load_profile
 from app.recommend import RecFilters, recommend
 
 logging.basicConfig(
@@ -296,6 +297,10 @@ def get_recommendations(
         k_per_vector=pipeline.settings.vector_query_k,
         mode=pipeline.settings.embedding_score_mode,
         filters=filters,
+        profile=load_profile(session, pipeline.settings.shrinkage_k),
+        feature_weights=pipeline.settings.feature_weights,
+        reasons_per_film=pipeline.settings.profile_reasons_per_film,
+        min_reason_stars=pipeline.settings.profile_min_reason_stars,
     )
     return {
         "ready": True,

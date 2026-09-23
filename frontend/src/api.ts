@@ -85,6 +85,19 @@ export interface Recommendation {
   source: string;
   source_label: string;
   candidate_sources: string[];
+  profile_score: number | null;
+  profile_raw: number | null;
+  profile_reasons: ProfileReason[];
+}
+
+/** One feature behind score ①, e.g. "Director Denis Villeneuve", +0.9★ over 4 films. */
+export interface ProfileReason {
+  type: string;
+  value: string;
+  label: string;
+  stars: number;
+  n: number;
+  contribution: number;
 }
 
 export interface Facets {

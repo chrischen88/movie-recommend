@@ -28,6 +28,7 @@ from app.cache import ApiError, ResponseCache
 from app.config import Settings, get_settings
 from app.db import Candidate, IngestRun, Movie, UserFilm, get_engine, utcnow
 from app.embeddings import Embedder, SentenceTransformerEmbedder, build_document, doc_hash
+from app.profile import user_ratings
 from app.taste import TasteModel, build_taste_model
 from app.tmdb import TmdbClient, fetch_movie
 from app.vectorstore import ChromaStore, Metadata, VectorStore
@@ -377,19 +378,8 @@ class Pipeline:
         assert self.embedder is not None and self.store is not None
         self._update(run_id, stage="taste", progress_done=0, progress_total=0)
         with Session(self.engine) as s:
-            rated = s.exec(
-                select(UserFilm.tmdb_id, UserFilm.rating).where(
-                    col(UserFilm.tmdb_id).is_not(None), col(UserFilm.rating).is_not(None)
-                )
-            ).all()
+            ratings = user_ratings(s)
             genres = {m.tmdb_id: m.genres for m in s.exec(select(Movie))}
-
-        # Two Letterboxd entries can map to one TMDB film: average their ratings.
-        per_film: dict[int, list[float]] = {}
-        for tid, rating in rated:
-            if tid is not None and rating is not None:
-                per_film.setdefault(tid, []).append(rating)
-        ratings = {tid: sum(rs) / len(rs) for tid, rs in per_film.items()}
 
         model = build_taste_model(
             ratings,
