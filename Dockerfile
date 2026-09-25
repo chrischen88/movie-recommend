@@ -19,21 +19,19 @@ ENV PYTHONUNBUFFERED=1 \
     ANONYMIZED_TELEMETRY=False
 WORKDIR /app/backend
 
-# CPU-only PyTorch first, so sentence-transformers doesn't pull in the CUDA build (GBs).
-RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
-
 # Dependencies from pyproject.toml, in their own layer so code changes don't reinstall them.
 COPY backend/pyproject.toml ./
 RUN python -c "import tomllib; print('\n'.join(tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']))" > /tmp/requirements.txt \
  && pip install -r /tmp/requirements.txt
 
-# Bake the embedding model in, so a fresh machine never downloads it. Keep this in
-# sync with EMBEDDING_MODEL (config.py); changing the model means rebuilding.
-ARG EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('${EMBEDDING_MODEL}')"
-ENV HF_HUB_OFFLINE=1
-
 COPY backend/app ./app
+
+# Bake the embedding model's ONNX export in, so a fresh machine never downloads
+# it. Keep this in sync with EMBEDDING_MODEL (config.py); changing the model
+# means rebuilding.
+ARG EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
+RUN python -c "from app.embeddings import OnnxEmbedder; OnnxEmbedder.download('${EMBEDDING_MODEL}')"
+ENV HF_HUB_OFFLINE=1
 COPY deploy/start.sh /usr/local/bin/start
 COPY --from=web /web/dist /app/frontend/dist
 

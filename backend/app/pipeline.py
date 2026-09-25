@@ -31,7 +31,7 @@ from app.cache import ApiError, DailyBudgetExceeded, ResponseCache
 from app.collab import MFModel, TrainParams, load_scorer, train_als
 from app.config import Settings, get_settings
 from app.db import Movie, get_engine, purge_user_data, utcnow
-from app.embeddings import Embedder, SentenceTransformerEmbedder, build_document, doc_hash
+from app.embeddings import Embedder, OnnxEmbedder, build_document, doc_hash
 from app.library import Library
 from app.movielens import MovieLensError, download_dataset, is_downloaded, load_dataset
 from app.profile import TasteProfile, load_profile
@@ -701,6 +701,6 @@ def get_pipeline() -> Pipeline:
         settings,
         make_tmdb_client(settings, cache),
         omdb=make_omdb_client(settings, cache),
-        embedder=SentenceTransformerEmbedder(settings.embedding_model, settings.embedding_batch_size),
+        embedder=OnnxEmbedder(settings.embedding_model, settings.embedding_model_batch_size),
         store=ChromaStore(settings.chroma_path, settings.vector_collection),
     )

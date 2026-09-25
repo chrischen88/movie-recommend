@@ -1,4 +1,4 @@
-"""Film documents + text embedding (sentence-transformers behind a small protocol)."""
+"""Film documents + text embedding (ONNX Runtime behind a small protocol)."""
 
 from __future__ import annotations
 
@@ -25,35 +25,82 @@ class Embedder(Protocol):
         ...
 
 
-class SentenceTransformerEmbedder:
-    """Lazily loads the model on first use (the download can take a while)."""
+class OnnxEmbedder:
+    """BGE sentence embeddings with onnxruntime instead of PyTorch: the model's
+    own ONNX export (`onnx/model.onnx` in the Hugging Face repo), CLS pooling and
+    L2 normalization, as sentence-transformers does for BGE. Same vectors, but a
+    far smaller install, faster to load, and faster on a CPU.
 
-    def __init__(self, model_name: str, batch_size: int = 64) -> None:
+    Lazily loads on first use (the download can take a while; the Docker image
+    has it baked in).
+    """
+
+    MODEL_FILE = "onnx/model.onnx"
+
+    def __init__(self, model_name: str, batch_size: int = 8, threads: int | None = None) -> None:
         self.model_name = model_name
         self.batch_size = batch_size
-        self._model = None
+        self.threads = threads
+        self._session = None
+        self._tokenizer = None
+        self._inputs: list[str] = []
         self._lock = threading.Lock()
+
+    @classmethod
+    def download(cls, model_name: str) -> dict[str, str]:
+        """Fetch (or find in the Hugging Face cache) the files the embedder needs."""
+        from huggingface_hub import hf_hub_download
+
+        return {
+            name: hf_hub_download(model_name, name)
+            for name in (cls.MODEL_FILE, "tokenizer.json", "sentence_bert_config.json")
+        }
 
     def _load(self):  # type: ignore[no-untyped-def]
         with self._lock:
-            if self._model is None:
-                from sentence_transformers import SentenceTransformer
+            if self._session is None:
+                import json
 
-                log.info("loading embedding model %s", self.model_name)
-                self._model = SentenceTransformer(self.model_name)
-        return self._model
+                import onnxruntime as ort
+                from tokenizers import Tokenizer
+
+                log.info("loading embedding model %s (onnx)", self.model_name)
+                files = self.download(self.model_name)
+                with open(files["sentence_bert_config.json"]) as f:
+                    max_length = int(json.load(f).get("max_seq_length", 512))
+                tokenizer = Tokenizer.from_file(files["tokenizer.json"])
+                tokenizer.enable_truncation(max_length=max_length)
+                tokenizer.enable_padding(pad_id=tokenizer.token_to_id("[PAD]") or 0, pad_token="[PAD]")
+                opts = ort.SessionOptions()
+                if self.threads:
+                    opts.intra_op_num_threads = self.threads
+                session = ort.InferenceSession(files[self.MODEL_FILE], opts, providers=["CPUExecutionProvider"])
+                self._inputs = [i.name for i in session.get_inputs()]
+                self._tokenizer, self._session = tokenizer, session
+        return self._session, self._tokenizer
 
     def embed(self, texts: list[str]) -> np.ndarray:
         if not texts:
             return np.zeros((0, 0), dtype=np.float32)
-        vecs = self._load().encode(
-            texts,
-            batch_size=self.batch_size,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-        )
-        return np.asarray(vecs, dtype=np.float32)
+        session, tokenizer = self._load()
+        out = np.zeros((len(texts), 0), dtype=np.float32)
+        # Batch texts of similar length together: each batch is padded to its
+        # longest text, so this avoids wasting compute on padding.
+        order = sorted(range(len(texts)), key=lambda i: len(texts[i]))
+        for start in range(0, len(order), self.batch_size):
+            idx = order[start : start + self.batch_size]
+            enc = tokenizer.encode_batch([texts[i] for i in idx])
+            feed = {
+                "input_ids": np.array([e.ids for e in enc], dtype=np.int64),
+                "attention_mask": np.array([e.attention_mask for e in enc], dtype=np.int64),
+                "token_type_ids": np.array([e.type_ids for e in enc], dtype=np.int64),
+            }
+            hidden = session.run(None, {k: v for k, v in feed.items() if k in self._inputs})[0]
+            cls = l2_normalize(np.asarray(hidden[:, 0], dtype=np.float32))  # CLS pooling
+            if out.shape[1] == 0:
+                out = np.zeros((len(texts), cls.shape[1]), dtype=np.float32)
+            out[idx] = cls
+        return out
 
     def embed_query(self, text: str) -> np.ndarray:
         prefix = BGE_QUERY_INSTRUCTION if "bge" in self.model_name.lower() else ""

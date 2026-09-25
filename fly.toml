@@ -36,8 +36,11 @@ primary_region = "iad"
     timeout = "5s"
     grace_period = "60s"
 
-# 2 GB fits PyTorch + the embedding model during a pipeline run. It's also the
-# largest size Fly can suspend. Don't add swap: that disables suspend.
+# A dedicated CPU: embedding new films is sustained CPU work, and a shared CPU
+# is throttled to a crawl under it (measured ~0.2 films/s). Here: ~4.5 films/s.
+# Billed per second while running; the machine suspends when idle.
+# 2 GB is performance-1x's minimum and the largest size Fly can suspend; a
+# pipeline run peaks well under it. Don't add swap: that disables suspend.
 [[vm]]
-  size = "shared-cpu-1x"
+  size = "performance-1x"
   memory = "2gb"

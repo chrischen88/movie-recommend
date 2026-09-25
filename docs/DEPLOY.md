@@ -4,8 +4,8 @@ The whole app runs as one Fly Machine. FastAPI serves both the API and the built
 
 | File | Role |
 |---|---|
-| [`Dockerfile`](../Dockerfile) | Builds the UI, then a Python image with CPU-only PyTorch and the embedding model baked in |
-| [`fly.toml`](../fly.toml) | 2 GB `shared-cpu-1x`, the `/data` volume, suspend when idle, health check |
+| [`Dockerfile`](../Dockerfile) | Builds the UI, then a Python image with ONNX Runtime and the embedding model's ONNX export baked in |
+| [`fly.toml`](../fly.toml) | 2 GB `performance-1x` (a dedicated CPU), the `/data` volume, suspend when idle, health check |
 | [`deploy/start.sh`](../deploy/start.sh) | Entrypoint. Applies an uploaded data import, then starts uvicorn |
 | [`scripts/fly-push-data.sh`](../scripts/fly-push-data.sh) | Uploads your local `backend/data` to the server |
 
@@ -21,7 +21,7 @@ The whole app runs as one Fly Machine. FastAPI serves both the API and the built
    ```bash
    fly secrets set TMDB_API_KEY=... OMDB_API_KEY=...   # plus AUTH_PASSWORD=... for a private app
    ```
-4. Deploy: `make fly-deploy`. The first build takes a few minutes, mostly PyTorch.
+4. Deploy: `make fly-deploy`. The build takes a few minutes.
 5. Copy your film data up: `make fly-push-data`. It uploads the API cache, film metadata, the index and the MovieLens model, so the server starts with everything your local runs already fetched and embedded. User tables are stripped from the snapshot before it leaves your machine.
 6. Open `https://<your-app-name>.fly.dev` and log in.
 
@@ -56,15 +56,18 @@ Privacy: an export is processed in memory and dropped after an hour idle (`SESSI
 
 ## Cost
 
+The machine has a dedicated CPU because embedding new films is sustained CPU work, and a shared CPU is throttled to a crawl under it (measured ~0.2 films/s). On `performance-1x` the ONNX model loads in ~4 s and embeds ~4.5 films/s (PyTorch managed 3/s after a 13 s load). A test upload with 10 films the server hadn't seen, which brought in ~200 new candidates, took 70 s. You're billed per second while it runs; suspended, it costs storage only.
+
+
 These are Fly's base prices (Ashburn/Amsterdam) as of September 2026.
 
 | | Per month |
 |---|---|
-| Machine, 2 GB, while running ($0.0154/h) | ~$0.90 at 2 h/day; $11.07 always on |
+| Machine, `performance-1x` 2 GB, while running ($0.0447/h) | ~$2.70 at 2 h/day; $32.15 always on |
 | Volume, 3 GB × $0.15 | $0.45 |
 | Suspended machine's disk | ~$0.25 |
 | Outbound data, snapshots (first 10 GB free), shared IPv4, TLS | ~$0 |
-| **Typical personal use** | **~$2–4** |
+| **Typical use (a few people a week)** | **~$2–5** |
 
 ## Troubleshooting
 

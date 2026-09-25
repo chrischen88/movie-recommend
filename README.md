@@ -27,7 +27,7 @@ make train                                    # MovieLens model for score ③ (F
 
 ## Hosting
 
-The app deploys to Fly.io as a single machine that suspends when idle (about $2–4 a month for a handful of users a week). It can run public, with per-IP upload limits and a capped queue, or behind a shared password (`AUTH_PASSWORD`). See [docs/DEPLOY.md](docs/DEPLOY.md).
+The app deploys to Fly.io as a single machine that suspends when idle (about $2–5 a month for a handful of users a week). It can run public, with per-IP upload limits and a capped queue, or behind a shared password (`AUTH_PASSWORD`). See [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## Layout
 
@@ -42,7 +42,7 @@ backend/app/
   tmdb.py        TMDB client (v3 key or v4 bearer token) + metadata parsing
   matching.py    title/year → TMDB id matching with confidence scores
   pipeline.py    per-session run: matching → enrichment → collab → candidates → embedding → taste → blend → omdb
-  embeddings.py  film documents + sentence-transformers embedder
+  embeddings.py  film documents + ONNX Runtime embedder (BGE-small)
   vectorstore.py VectorStore interface: ChromaStore (default) + InMemoryStore
   taste.py       taste vector, k-means taste clusters, score ②
   recommend.py   assembles the ranked recommendation list

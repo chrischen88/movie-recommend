@@ -101,7 +101,10 @@ class Settings(BaseSettings):
 
     # --- Embeddings / vector DB ---
     embedding_model: str = "BAAI/bge-small-en-v1.5"
-    embedding_batch_size: int = 64
+    embedding_batch_size: int = 64  # films embedded and written to the index per step
+    # Texts per model call. Peak memory grows with batch × text length²: 64 long
+    # film documents need ~3 GB, 8 need ~0.9 GB, at the same speed on one CPU.
+    embedding_model_batch_size: int = 8
     vector_collection: str = "movies"
     taste_cluster_min_rating: float = 4.0
     taste_cluster_k_range: tuple[int, int] = (3, 6)

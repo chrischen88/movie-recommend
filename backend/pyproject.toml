@@ -12,7 +12,9 @@ dependencies = [
     "python-multipart>=0.0.9",
     "numpy>=2",
     "scikit-learn>=1.5",
-    "sentence-transformers>=3",
+    "onnxruntime>=1.17",
+    "tokenizers>=0.15",
+    "huggingface-hub>=0.20",
     "chromadb>=1.0",
 ]
 
