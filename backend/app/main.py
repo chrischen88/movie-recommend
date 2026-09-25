@@ -166,13 +166,13 @@ async def create_demo_session(request: Request, store: StoreDep, pipeline: Pipel
     """A session on the built-in sample profile (app/demo.py), for visitors
     without an export. The browser's saved fixes belong to their own export, so
     they aren't applied here."""
-    _check_upload_rate(request, store)
+    _check_upload_rate(request, store, demo=True)
     return await _start_session(demo_export_zip(), {}, store, pipeline)
 
 
-def _check_upload_rate(request: Request, store: SessionStore) -> None:
+def _check_upload_rate(request: Request, store: SessionStore, *, demo: bool = False) -> None:
     try:
-        store.check_upload_rate(_client_ip(request))
+        store.check_upload_rate(_client_ip(request), demo=demo)
     except RateLimited as exc:
         raise HTTPException(429, str(exc)) from exc
 

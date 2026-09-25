@@ -422,8 +422,16 @@ def test_demo_session(client: TestClient) -> None:
     assert client.get("/api/session").json()["run"]["status"] == "done"
 
 
-def test_demo_session_shares_the_upload_rate_limit(client: TestClient, sample_zip: bytes) -> None:
-    store_of().settings.uploads_per_ip_per_hour = 2
+def test_demo_sessions_have_their_own_rate_limit(client: TestClient, sample_zip: bytes) -> None:
+    settings = store_of().settings
+    settings.uploads_per_ip_per_hour = 1
+    settings.demo_sessions_per_ip_per_hour = 2
     upload(client, sample_zip)
+    # Uploads used up; demos still work, up to their own limit.
     assert client.post("/api/sessions/demo").status_code == 200
-    assert client.post("/api/sessions/demo").status_code == 429
+    assert client.post("/api/sessions/demo").status_code == 200
+    limited = client.post("/api/sessions/demo")
+    assert limited.status_code == 429 and "Sample profile" in limited.json()["detail"]
+    # Demos don't count toward the upload limit either way.
+    settings.uploads_per_ip_per_hour = 2
+    upload(client, sample_zip)

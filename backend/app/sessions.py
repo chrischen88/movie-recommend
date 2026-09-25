@@ -97,7 +97,7 @@ class SessionStore:
         self._lock = threading.Lock()
         self._sessions: dict[str, UserSession] = {}
         self._queue: list[str] = []  # sessions with a queued or running run, oldest first
-        self._uploads: dict[str, deque[float]] = {}  # client → upload times in the last hour
+        self._uploads: dict[tuple[str, str], deque[float]] = {}  # (kind, client) → times in the last hour
 
     # ------------------------------------------------------------ sessions
 
@@ -144,18 +144,21 @@ class SessionStore:
 
     # ------------------------------------------------------------ uploads
 
-    def check_upload_rate(self, client: str) -> None:
-        """Count an upload from `client`, or raise if it's over the hourly limit."""
-        limit = self.settings.uploads_per_ip_per_hour
+    def check_upload_rate(self, client: str, *, demo: bool = False) -> None:
+        """Count an upload from `client`, or raise if it's over the hourly limit.
+        Demo sessions have their own count and limit."""
+        s = self.settings
+        limit = s.demo_sessions_per_ip_per_hour if demo else s.uploads_per_ip_per_hour
         if limit <= 0:
             return
         now = self._clock()
         with self._lock:
-            times = self._uploads.setdefault(client, deque())
+            times = self._uploads.setdefault(("demo" if demo else "upload", client), deque())
             while times and now - times[0] >= UPLOAD_WINDOW_SECONDS:
                 times.popleft()
             if len(times) >= limit:
-                raise RateLimited(f"Upload limit reached ({limit} an hour). Try again later.")
+                what = "Sample profile" if demo else "Upload"
+                raise RateLimited(f"{what} limit reached ({limit} an hour). Try again later.")
             times.append(now)
 
     # ------------------------------------------------------------ runs
@@ -206,8 +209,8 @@ class SessionStore:
         ttl = self.settings.session_ttl_seconds
         for sid in [sid for sid, s in self._sessions.items() if now - s.last_seen > ttl]:
             self._drop(self._sessions.pop(sid))
-        for client in [c for c, t in self._uploads.items() if not t or now - t[-1] >= UPLOAD_WINDOW_SECONDS]:
-            del self._uploads[client]
+        for key in [k for k, t in self._uploads.items() if not t or now - t[-1] >= UPLOAD_WINDOW_SECONDS]:
+            del self._uploads[key]
 
 
 @lru_cache

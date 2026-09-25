@@ -68,6 +68,10 @@ class Settings(BaseSettings):
     max_sessions: int = 20
     max_queued_runs: int = 5  # pipeline runs waiting or running; one runs at a time
     uploads_per_ip_per_hour: int = 10  # 0 disables the limit
+    # Sample-profile sessions (app/demo.py), counted separately: once its films are
+    # cached a demo run costs no API calls or embedding, and visitors from one
+    # office share an IP. The session and queue caps above still apply.
+    demo_sessions_per_ip_per_hour: int = 60  # 0 disables the limit
 
     # --- TMDB matching ---
     match_low_confidence_threshold: float = 0.75
