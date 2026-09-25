@@ -61,6 +61,13 @@ class Settings(BaseSettings):
     # --- Upload limits ---
     max_upload_bytes: int = 50 * 1024 * 1024
     max_uncompressed_csv_bytes: int = 100 * 1024 * 1024
+    max_export_films: int = 5000
+
+    # --- User sessions (in memory only; nothing about a user is written to disk) ---
+    session_ttl_seconds: int = 60 * 60  # dropped after this long without a request
+    max_sessions: int = 20
+    max_queued_runs: int = 5  # pipeline runs waiting or running; one runs at a time
+    uploads_per_ip_per_hour: int = 10  # 0 disables the limit
 
     # --- TMDB matching ---
     match_low_confidence_threshold: float = 0.75
@@ -149,14 +156,6 @@ class Settings(BaseSettings):
     @property
     def chroma_path(self) -> Path:
         return self.data_dir / self.chroma_dirname
-
-    @property
-    def taste_model_path(self) -> Path:
-        return self.data_dir / "taste_model.json"
-
-    @property
-    def blend_model_path(self) -> Path:
-        return self.data_dir / "blend_model.json"
 
     @property
     def movielens_root(self) -> Path:

@@ -1,5 +1,5 @@
-"""What a hosted deployment relies on: the API serving the built UI, the optional
-Basic-auth gate, and recovering runs a restart interrupted."""
+"""What a hosted deployment relies on: the API serving the built UI and the
+optional Basic-auth gate."""
 
 from __future__ import annotations
 
@@ -10,10 +10,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
-from sqlmodel import Session
 
 from app.config import get_settings
-from app.db import IngestRun
 from app.main import app
 from tests.test_api import make_client
 
@@ -80,39 +78,20 @@ def test_no_build_means_no_frontend(client: TestClient, tmp_path: Path, monkeypa
 
 
 def test_auth_off_without_password(client: TestClient) -> None:
-    assert client.get("/api/films").status_code == 200
+    assert client.get("/api/matches").status_code == 410  # reached the app: no session yet
 
 
 def test_auth_gates_everything_but_health(client: TestClient, dist: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(get_settings(), "auth_password", "hunter2")
 
-    for path in ("/api/films", "/", "/assets/index-abc123.js"):
+    for path in ("/api/matches", "/", "/assets/index-abc123.js"):
         resp = client.get(path)
         assert resp.status_code == 401, path
         assert resp.headers["www-authenticate"].startswith("Basic ")
     assert client.get("/api/health").status_code == 200
 
-    assert client.get("/api/films", headers=basic("letterboxd", "hunter2")).status_code == 200
+    assert client.get("/api/matches", headers=basic("letterboxd", "hunter2")).status_code == 410
     assert client.get("/", headers=basic("letterboxd", "hunter2")).status_code == 200
     for bad in (basic("letterboxd", "wrong"), basic("admin", "hunter2"),
                 {"Authorization": "Basic not-base64!"}, {"Authorization": "Bearer hunter2"}):
-        assert client.get("/api/films", headers=bad).status_code == 401
-
-
-# ---------------------------------------------------------------- restarts
-
-
-def test_startup_fails_runs_left_running(engine: Engine) -> None:
-    with Session(engine) as s:
-        s.add(IngestRun(stage="embedding"))  # status defaults to "running"
-        s.add(IngestRun(stage="omdb", status="done"))
-        s.commit()
-
-    with make_client(engine, None) as c:
-        runs = {r["stage"]: r for r in (c.get(f"/api/ingest/{i}").json()["run"] for i in (1, 2))}
-    app.dependency_overrides.clear()
-
-    assert runs["embedding"]["status"] == "error"
-    assert "Interrupted" in runs["embedding"]["message"]
-    assert runs["embedding"]["finished_at"] is not None
-    assert runs["omdb"]["status"] == "done"
+        assert client.get("/api/matches", headers=bad).status_code == 401

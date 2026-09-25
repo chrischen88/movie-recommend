@@ -1,9 +1,15 @@
-"""FastAPI application entry point."""
+"""FastAPI application entry point.
+
+Each visitor works in an in-memory session (app/sessions.py): uploading an
+export creates one, and every other endpoint finds it by the `X-Session-Id`
+header. Nothing about a user is written to disk; only film data is shared.
+"""
 
 from __future__ import annotations
 
 import base64
 import binascii
+import json
 import logging
 import secrets
 from collections import Counter
@@ -12,34 +18,40 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Annotated, Any, Literal
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from sqlmodel import Session, col, select
+from starlette.concurrency import run_in_threadpool
 
 from app import matching
-from app.blend import BlendModel
 from app.cache import ResponseCache
 from app.collab import load_scorer
 from app.config import get_settings
-from app.db import Candidate, IngestRun, Movie, UserFilm, get_session, utcnow
-from app.ingest import sync_export
+from app.db import Movie, get_session, utcnow
 from app.letterboxd import ExportError, parse_export
+from app.library import InvalidFixes, Library, LibraryFilm, applied_fixes, library_from_export
 from app.pipeline import STAGES, Pipeline, TmdbUnavailable, get_pipeline
-from app.recommend import RatingSource, RecFilters, eligible_ids
+from app.recommend import RatingSource, RecFilters
+from app.sessions import AlreadyQueued, Busy, RateLimited, SessionStore, UserSession, get_session_store
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 )
+# httpx logs every request URL at INFO: that's search queries (film titles from
+# users' exports) and api_key query params. Keep them out of the logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("app")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Resolved through the overrides so tests get their own pipeline and database.
     pipeline = app.dependency_overrides.get(get_pipeline, get_pipeline)()
-    pipeline.fail_interrupted_runs()
+    pipeline.purge_user_data()
     yield
+    app.dependency_overrides.get(get_session_store, get_session_store)().shutdown()
 
 
 app = FastAPI(title="Letterboxd Recommender", lifespan=lifespan)
@@ -84,8 +96,28 @@ async def basic_auth(request: Request, call_next: Callable[[Request], Awaitable[
     return await call_next(request)
 
 
-SessionDep = Annotated[Session, Depends(get_session)]
+DbDep = Annotated[Session, Depends(get_session)]
 PipelineDep = Annotated[Pipeline, Depends(get_pipeline)]
+StoreDep = Annotated[SessionStore, Depends(get_session_store)]
+
+SESSION_GONE = "Your session has expired or was deleted. Upload your export again."
+
+
+def current_session(store: StoreDep, x_session_id: Annotated[str | None, Header()] = None) -> UserSession:
+    """The caller's session. 410 (not 404) when it's gone, so the UI can tell an
+    expired session from a missing film and send the user back to upload."""
+    session = store.get(x_session_id)
+    if session is None:
+        raise HTTPException(410, SESSION_GONE)
+    return session
+
+
+UserSessionDep = Annotated[UserSession, Depends(current_session)]
+
+
+def _client_ip(request: Request) -> str:
+    # Fly's proxy sets Fly-Client-IP (overwriting any client-sent value).
+    return request.headers.get("fly-client-ip") or (request.client.host if request.client else "unknown")
 
 
 @app.get("/api/health")
@@ -101,106 +133,106 @@ def health() -> dict[str, object]:
     }
 
 
-# ---------------------------------------------------------------- ingestion
+# ---------------------------------------------------------------- sessions
 
 
-class RunOut(BaseModel):
-    run: IngestRun
-    stages: list[str]
-
-
-@app.post("/api/upload")
-async def upload_export(
-    file: UploadFile, session: SessionDep, pipeline: PipelineDep, background: BackgroundTasks
+@app.post("/api/sessions")
+async def create_session(
+    request: Request,
+    file: UploadFile,
+    store: StoreDep,
+    pipeline: PipelineDep,
+    fixes: Annotated[str, Form()] = "{}",
 ) -> dict[str, object]:
-    settings = get_settings()
+    """Parse an export into a new in-memory session and queue its processing.
+    `fixes` is the browser's saved match fixes (see library_from_export)."""
+    settings = store.settings
+    try:
+        store.check_upload_rate(_client_ip(request))
+    except RateLimited as exc:
+        raise HTTPException(429, str(exc)) from exc
     data = await file.read(settings.max_upload_bytes + 1)
     if len(data) > settings.max_upload_bytes:
         raise HTTPException(413, "upload too large")
-    if not pipeline.try_acquire():
-        raise HTTPException(409, "an ingestion run is already in progress")
+    try:
+        fix_map = json.loads(fixes)
+    except ValueError:
+        fix_map = None
+    if not isinstance(fix_map, dict):
+        raise HTTPException(400, "fixes must be a JSON object")
 
     try:
-        run = IngestRun(stage="parsing")
-        session.add(run)
-        session.commit()
-        session.refresh(run)
-        assert run.id is not None
+        export = await run_in_threadpool(parse_export, data, max_csv_bytes=settings.max_uncompressed_csv_bytes)
+    except ExportError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if len(export.films) > settings.max_export_films:
+        raise HTTPException(
+            413, f"This export has {len(export.films)} films; the limit is {settings.max_export_films}."
+        )
+    try:
+        lib = library_from_export(export, fix_map)
+    except InvalidFixes as exc:
+        raise HTTPException(400, str(exc)) from exc
 
-        try:
-            export = parse_export(data, max_csv_bytes=settings.max_uncompressed_csv_bytes)
-        except ExportError as exc:
-            run.status, run.message, run.finished_at = "error", str(exc), utcnow()
-            session.add(run)
-            session.commit()
-            raise HTTPException(400, str(exc)) from exc
-
-        result = sync_export(session, export)
-        if result.reset:
-            pipeline.discard_user_models()
-        run.stats = {
-            **result.summary(),
-            "account": result.account,
-            "films": len(export.films),
-            "rated": len(export.rated),
-            "watchlist": len(export.watchlist),
-            "warnings": len(export.warnings),
-        }
-        session.add(run)
-        session.commit()
-    except BaseException:
-        pipeline.release()
-        raise
-
-    background.add_task(pipeline.run, run.id)
+    upload = {
+        "films": len(export.films),
+        "rated": len(export.rated),
+        "watchlist": len(export.watchlist),
+        "warnings": len(export.warnings),
+        "fixes_applied": applied_fixes(lib),
+    }
+    try:
+        session = store.create(lib, upload)
+    except Busy as exc:
+        raise HTTPException(503, str(exc)) from exc
+    try:
+        store.submit(session, pipeline.run_session)
+    except Busy as exc:
+        store.delete(session.id)
+        raise HTTPException(503, str(exc)) from exc
     return {
-        "run_id": run.id,
+        "session_id": session.id,
+        "expires_in": store.expires_in(session),
         "files_found": export.files_found,
-        "stats": run.stats,
+        "stats": upload,
         "warnings": export.warnings,
     }
 
 
-@app.post("/api/ingest/resume")
-def resume_ingest(
-    session: SessionDep, pipeline: PipelineDep, background: BackgroundTasks
-) -> dict[str, int]:
-    """Re-run the pipeline on already-ingested films (e.g. after adding a key)."""
-    if not pipeline.try_acquire():
-        raise HTTPException(409, "an ingestion run is already in progress")
+def _session_out(store: SessionStore, session: UserSession) -> dict[str, object]:
+    run = {k: v for k, v in asdict(session.run).items() if k != "cancelled"}
+    return {
+        "run": run,
+        "stages": STAGES,
+        "queue_position": store.queue_position(session),
+        "expires_in": store.expires_in(session),
+    }
+
+
+@app.get("/api/session")
+def get_session_state(session: UserSessionDep, store: StoreDep) -> dict[str, object]:
+    return _session_out(store, session)
+
+
+@app.post("/api/session/reprocess")
+def reprocess(session: UserSessionDep, store: StoreDep, pipeline: PipelineDep) -> dict[str, object]:
+    """Run the pipeline again, e.g. after fixing matches."""
     try:
-        run = IngestRun(stage="matching")
-        session.add(run)
-        session.commit()
-        session.refresh(run)
-        assert run.id is not None
-    except BaseException:
-        pipeline.release()
-        raise
-    background.add_task(pipeline.run, run.id)
-    return {"run_id": run.id}
+        store.submit(session, pipeline.run_session)
+    except AlreadyQueued as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except Busy as exc:
+        raise HTTPException(503, str(exc)) from exc
+    return _session_out(store, session)
 
 
-@app.get("/api/ingest/latest")
-def latest_run(session: SessionDep) -> RunOut | None:
-    run = session.exec(select(IngestRun).order_by(col(IngestRun.id).desc())).first()
-    return RunOut(run=run, stages=STAGES) if run else None
+@app.delete("/api/session")
+def delete_session(store: StoreDep, x_session_id: Annotated[str | None, Header()] = None) -> dict[str, bool]:
+    """Forget the session now instead of when it expires."""
+    return {"deleted": bool(x_session_id) and store.delete(x_session_id or "")}
 
 
-@app.get("/api/ingest/{run_id}")
-def get_run(run_id: int, session: SessionDep) -> RunOut:
-    run = session.get(IngestRun, run_id)
-    if run is None:
-        raise HTTPException(404, "run not found")
-    return RunOut(run=run, stages=STAGES)
-
-
-# ---------------------------------------------------------------- films & matches
-
-
-@app.get("/api/films")
-def list_films(session: SessionDep) -> list[UserFilm]:
-    return list(session.exec(select(UserFilm).order_by(UserFilm.name)).all())
+# ---------------------------------------------------------------- matches
 
 
 class MovieBrief(BaseModel):
@@ -224,7 +256,7 @@ class MatchRow(BaseModel):
     movie: MovieBrief | None
 
 
-def _match_row(film: UserFilm, movie: Movie | None) -> MatchRow:
+def _match_row(film: LibraryFilm, movie: Movie | None) -> MatchRow:
     return MatchRow(
         film_key=film.film_key,
         name=film.name,
@@ -240,20 +272,15 @@ def _match_row(film: UserFilm, movie: Movie | None) -> MatchRow:
 
 @app.get("/api/matches")
 def list_matches(
-    session: SessionDep, filter: Literal["review", "all"] = "review"
+    session: UserSessionDep, db: DbDep, filter: Literal["review", "all"] = "review"
 ) -> dict[str, object]:
-    stmt = select(UserFilm, Movie).join(
-        Movie, col(UserFilm.tmdb_id) == col(Movie.tmdb_id), isouter=True
-    )
+    films = sorted(session.library.films.values(), key=lambda f: f.name)
+    counts = Counter(f.match_status or "pending" for f in films)
     if filter == "review":
-        stmt = stmt.where(col(UserFilm.match_status).in_(matching.NEEDS_REVIEW))
-    rows = session.exec(stmt.order_by(UserFilm.name)).all()
-
-    counts: dict[str, int] = {}
-    for status in session.exec(select(UserFilm.match_status)).all():
-        key = status or "pending"
-        counts[key] = counts.get(key, 0) + 1
-    return {"counts": counts, "rows": [_match_row(f, m) for f, m in rows]}
+        films = [f for f in films if f.match_status in matching.NEEDS_REVIEW]
+    ids = {f.tmdb_id for f in films if f.tmdb_id is not None}
+    movies = {m.tmdb_id: m for m in db.exec(select(Movie).where(col(Movie.tmdb_id).in_(ids)))}
+    return {"counts": dict(counts), "rows": [_match_row(f, movies.get(f.tmdb_id or -1)) for f in films]}
 
 
 class SetMatchIn(BaseModel):
@@ -265,65 +292,64 @@ class FilmKeyIn(BaseModel):
     film_key: str
 
 
-def _row_for(session: SessionDep, film_key: str) -> MatchRow:
-    film = session.get(UserFilm, film_key)
-    assert film is not None
-    movie = session.get(Movie, film.tmdb_id) if film.tmdb_id else None
-    return _match_row(film, movie)
+def _editable(session: UserSession, film_key: str) -> LibraryFilm:
+    if session.run.active:
+        raise HTTPException(409, "Wait until processing finishes before fixing matches.")
+    try:
+        return session.library.film(film_key)
+    except KeyError as exc:
+        raise HTTPException(404, "film not found") from exc
 
 
 @app.post("/api/matches/set")
-def set_match(body: SetMatchIn, session: SessionDep, pipeline: PipelineDep) -> MatchRow:
+def set_match(body: SetMatchIn, session: UserSessionDep, pipeline: PipelineDep) -> MatchRow:
+    _editable(session, body.film_key)
     tmdb_id = matching.parse_tmdb_ref(body.tmdb_ref)
     if tmdb_id is None:
         raise HTTPException(400, "enter a TMDB id or a themoviedb.org/movie/… URL")
     try:
-        pipeline.set_manual_match(body.film_key, tmdb_id)
-    except KeyError as exc:
-        raise HTTPException(404, "film not found") from exc
+        movie = pipeline.lookup_movie(tmdb_id)
     except LookupError as exc:
         raise HTTPException(404, str(exc)) from exc
     except TmdbUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
-    return _row_for(session, body.film_key)
+    film = session.library.set_manual(
+        body.film_key, tmdb_id, f"manually set to {movie.title!r} ({movie.year or '?'})"
+    )
+    return _match_row(film, movie)
 
 
 @app.post("/api/matches/accept")
-def accept_match(body: FilmKeyIn, session: SessionDep, pipeline: PipelineDep) -> MatchRow:
-    film = session.get(UserFilm, body.film_key)
-    if film is None:
-        raise HTTPException(404, "film not found")
+def accept_match(body: FilmKeyIn, session: UserSessionDep, db: DbDep) -> MatchRow:
+    film = _editable(session, body.film_key)
     if film.tmdb_id is None:
         raise HTTPException(400, "film has no candidate match to accept")
-    pipeline.set_status(body.film_key, matching.MANUAL, f"accepted by user (tmdb {film.tmdb_id})")
-    session.expire_all()
-    return _row_for(session, body.film_key)
+    session.library.set_status(body.film_key, matching.MANUAL, f"accepted by you (tmdb {film.tmdb_id})")
+    return _match_row(film, db.get(Movie, film.tmdb_id))
 
 
 @app.post("/api/matches/ignore")
-def ignore_match(body: FilmKeyIn, session: SessionDep, pipeline: PipelineDep) -> MatchRow:
-    try:
-        pipeline.set_status(body.film_key, matching.IGNORED, "ignored by user")
-    except KeyError as exc:
-        raise HTTPException(404, "film not found") from exc
-    session.expire_all()
-    return _row_for(session, body.film_key)
+def ignore_match(body: FilmKeyIn, session: UserSessionDep) -> MatchRow:
+    _editable(session, body.film_key)
+    film = session.library.set_status(body.film_key, matching.IGNORED, "ignored by you")
+    return _match_row(film, None)
 
 
 # ---------------------------------------------------------------- recommendations
 
 
-def _not_ready(pipeline: Pipeline) -> str | None:
+def _not_ready(lib: Library, pipeline: Pipeline) -> str | None:
     if pipeline.store is None:
         return "No vector store configured."
-    if pipeline.load_taste() is None:
+    if lib.taste is None:
         return "No taste model yet: upload an export and let processing finish."
     return None
 
 
 @app.get("/api/recommendations")
 def get_recommendations(
-    session: SessionDep,
+    session: UserSessionDep,
+    db: DbDep,
     pipeline: PipelineDep,
     limit: int = 40,
     min_rating: Annotated[float | None, Query(ge=0, le=100)] = None,
@@ -334,7 +360,8 @@ def get_recommendations(
     max_runtime: Annotated[int | None, Query(gt=0)] = None,
     language: str | None = None,
 ) -> dict[str, Any]:
-    reason = _not_ready(pipeline)
+    lib = session.library
+    reason = _not_ready(lib, pipeline)
     if reason:
         return {"ready": False, "message": reason, "items": []}
     if min_rating is not None and rating_source in ("tmdb", "imdb") and min_rating > 10:
@@ -351,9 +378,9 @@ def get_recommendations(
         max_runtime=max_runtime,
         language=language or None,
     )
-    out = pipeline.recommend(session, limit=max(1, min(limit, 200)), filters=filters)
+    out = pipeline.recommend(lib, db, limit=max(1, min(limit, 200)), filters=filters)
     if out is None:
-        return {"ready": False, "message": _not_ready(pipeline), "items": []}
+        return {"ready": False, "message": _not_ready(lib, pipeline), "items": []}
     result, blend = out
     return {
         "ready": True,
@@ -368,17 +395,18 @@ def get_recommendations(
 
 
 @app.get("/api/metrics")
-def get_metrics(session: SessionDep, pipeline: PipelineDep) -> dict[str, Any]:
+def get_metrics(session: UserSessionDep, db: DbDep, pipeline: PipelineDep) -> dict[str, Any]:
     """How well each score and the blend predict the user's own held-out ratings,
     plus the blend weights and data-source usage."""
     cfg = pipeline.settings
-    blend = BlendModel.load(cfg.blend_model_path)
+    lib = session.library
+    blend = lib.blend
     if blend is None:
         return {"ready": False, "message": "No blend yet: upload an export and let processing finish."}
     scorer = load_scorer(cfg.collab_model_path, cfg.collab_min_item_ratings) if cfg.collab_enabled else None
     sources: Counter[str] = Counter()
-    for cand in session.exec(select(Candidate)):
-        for kind in {src.split(":", 1)[0] for src in cand.sources}:
+    for srcs in lib.candidates.values():
+        for kind in {src.split(":", 1)[0] for src in srcs}:
             sources[kind] += 1
     start_of_day = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     return {
@@ -396,20 +424,21 @@ def get_metrics(session: SessionDep, pipeline: PipelineDep) -> dict[str, Any]:
         "collab_model": scorer.model.meta if scorer else None,
         "omdb": {
             "enabled": pipeline.omdb is not None,
-            "used_today": ResponseCache(session.get_bind()).count_created_since("omdb", start_of_day),  # type: ignore[arg-type]
+            "used_today": ResponseCache(db.get_bind()).count_created_since("omdb", start_of_day),  # type: ignore[arg-type]
             "daily_limit": cfg.omdb_daily_limit,
         },
-        "candidates": {"total": len(eligible_ids(session)), "by_source": dict(sources.most_common())},
+        "candidates": {"total": len(lib.eligible_ids()), "by_source": dict(sources.most_common())},
     }
 
 
 @app.get("/api/taste")
-def get_taste(session: SessionDep, pipeline: PipelineDep) -> dict[str, Any]:
-    model = pipeline.load_taste()
+def get_taste(session: UserSessionDep, db: DbDep, pipeline: PipelineDep) -> dict[str, Any]:
+    lib = session.library
+    model = lib.taste
     if model is None:
-        return {"ready": False, "message": _not_ready(pipeline), "clusters": []}
+        return {"ready": False, "message": _not_ready(lib, pipeline), "clusters": []}
     ids = {i for c in model.clusters for i in c.member_ids}
-    movies = {m.tmdb_id: m for m in session.exec(select(Movie).where(col(Movie.tmdb_id).in_(ids)))}
+    movies = {m.tmdb_id: m for m in db.exec(select(Movie).where(col(Movie.tmdb_id).in_(ids)))}
     return {
         "ready": True,
         "mean_rating": model.mean_rating,

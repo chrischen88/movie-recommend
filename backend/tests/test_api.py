@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine
-from sqlmodel import Session, select
+from sqlalchemy import Engine, inspect
+from sqlmodel import Session
 
-from app.db import UserFilm, get_session, make_engine
+from app.db import get_session
+from app.letterboxd import make_film_key
+from app.library import Library
 from app.main import app
 from app.pipeline import get_pipeline
-from app.recommend import current_film_ids
+from app.sessions import InlineExecutor, SessionStore, get_session_store
 from tests.fake_movielens import write_fake_movielens
 from tests.fake_omdb import FakeOmdb
 from tests.fake_tmdb import FakeTmdb, movie
@@ -20,14 +23,23 @@ from tests.test_pipeline import SAMPLE_TMDB, fake_for_sample, make_pipeline
 
 
 def make_client(engine: Engine, fake: FakeTmdb | None, omdb: FakeOmdb | None = None) -> TestClient:
+    """A client on a fresh app state: its own DB, pipeline and session store.
+    Pipeline runs execute inline, so an upload returns after processing."""
+
     def _session() -> Iterator[Session]:
         with Session(engine) as s:
             yield s
 
     pipeline = make_pipeline(engine, fake, omdb=omdb)
+    store = SessionStore(pipeline.settings, executor=InlineExecutor())
     app.dependency_overrides[get_session] = _session
     app.dependency_overrides[get_pipeline] = lambda: pipeline
+    app.dependency_overrides[get_session_store] = lambda: store
     return TestClient(app)
+
+
+def store_of() -> SessionStore:
+    return app.dependency_overrides[get_session_store]()
 
 
 @pytest.fixture
@@ -46,10 +58,20 @@ def keyless_client(engine: Engine) -> Iterator[TestClient]:
     app.dependency_overrides.clear()
 
 
-def upload(c: TestClient, data: bytes) -> dict:
-    resp = c.post("/api/upload", files={"file": ("export.zip", data, "application/zip")})
+def upload(c: TestClient, data: bytes, fixes: dict | None = None) -> dict:
+    """Upload an export and make `c` send the new session's id from now on."""
+    form = {"fixes": json.dumps(fixes)} if fixes is not None else {}
+    resp = c.post("/api/sessions", files={"file": ("export.zip", data, "application/zip")}, data=form)
     assert resp.status_code == 200, resp.text
-    return resp.json()
+    body = resp.json()
+    c.headers["X-Session-Id"] = body["session_id"]
+    return body
+
+
+def library_of(c: TestClient) -> Library:
+    session = store_of().get(c.headers["X-Session-Id"])
+    assert session is not None
+    return session.library
 
 
 def test_health(client: TestClient) -> None:
@@ -60,32 +82,43 @@ def test_health(client: TestClient) -> None:
 
 def test_upload_runs_pipeline(client: TestClient, sample_zip: bytes) -> None:
     body = upload(client, sample_zip)
-    assert body["stats"]["added"] == 35
-    assert body["stats"]["rated"] == 28
+    assert len(body["session_id"]) >= 40 and body["expires_in"] > 0
+    assert body["stats"] == {"films": 35, "rated": 28, "watchlist": 6, "warnings": len(body["warnings"]),
+                             "fixes_applied": 0}
     assert any("Heat" in w for w in body["warnings"])
 
-    # TestClient runs background tasks before returning.
-    out = client.get(f"/api/ingest/{body['run_id']}").json()
+    # The inline executor runs the pipeline before the upload returns.
+    out = client.get("/api/session").json()
     assert out["stages"] == ["parsing", "matching", "enrichment", "collab", "candidates", "embedding", "taste", "blend", "omdb"]
-    assert out["run"]["status"] == "done"
+    assert out["run"]["status"] == "done" and out["queue_position"] is None
     assert out["run"]["stats"]["matching"]["matched"] == 34
-    assert client.get("/api/ingest/latest").json()["run"]["id"] == body["run_id"]
-
-    assert len(client.get("/api/films").json()) == 35
-    assert upload(client, sample_zip)["stats"]["unchanged"] == 35
+    assert out["run"]["stats"]["films"] == 35  # upload counts carried into the run
+    assert "cancelled" not in out["run"]
 
 
-def test_upload_rejects_garbage_and_releases_lock(client: TestClient, sample_zip: bytes) -> None:
-    resp = client.post("/api/upload", files={"file": ("x.zip", b"nope", "application/zip")})
-    assert resp.status_code == 400
-    assert "ZIP" in resp.json()["detail"]
-    upload(client, sample_zip)  # lock was released
+def test_upload_rejects_garbage(client: TestClient, sample_zip: bytes) -> None:
+    resp = client.post("/api/sessions", files={"file": ("x.zip", b"nope", "application/zip")})
+    assert resp.status_code == 400 and "ZIP" in resp.json()["detail"]
+    for bad in ("not json", "[1]", json.dumps({"x|": {"tmdb_id": "7"}})):
+        resp = client.post("/api/sessions", files={"file": ("e.zip", sample_zip, "application/zip")},
+                           data={"fixes": bad})
+        assert resp.status_code == 400, bad
+    assert len(store_of()) == 0
+    upload(client, sample_zip)
 
 
 def test_upload_without_tmdb_key(keyless_client: TestClient, sample_zip: bytes) -> None:
-    body = upload(keyless_client, sample_zip)
-    run = keyless_client.get(f"/api/ingest/{body['run_id']}").json()["run"]
+    upload(keyless_client, sample_zip)
+    run = keyless_client.get("/api/session").json()["run"]
     assert run["status"] == "done" and "TMDB_API_KEY" in run["message"]
+
+
+def test_endpoints_need_a_live_session(client: TestClient) -> None:
+    for path in ("/api/session", "/api/matches", "/api/recommendations", "/api/taste", "/api/metrics"):
+        assert client.get(path).status_code == 410, path
+        assert client.get(path, headers={"X-Session-Id": "made-up"}).status_code == 410, path
+    assert client.post("/api/session/reprocess").status_code == 410
+    assert client.post("/api/matches/ignore", json={"film_key": "x"}).status_code == 410
 
 
 def test_match_review_flow(client: TestClient, sample_zip: bytes) -> None:
@@ -104,12 +137,14 @@ def test_match_review_flow(client: TestClient, sample_zip: bytes) -> None:
     assert bad.status_code == 400
     missing = client.post("/api/matches/set", json={"film_key": key, "tmdb_ref": "424242"})
     assert missing.status_code == 404
+    assert client.post("/api/matches/set", json={"film_key": "nope|", "tmdb_ref": "777"}).status_code == 404
 
     fixed = client.post(
         "/api/matches/set",
         json={"film_key": key, "tmdb_ref": "https://www.themoviedb.org/movie/777-some-home-video"},
     ).json()
-    assert fixed["status"] == "manual" and fixed["movie"]["title"] == "Some Home Video"
+    assert fixed["status"] == "manual" and fixed["tmdb_id"] == 777
+    assert fixed["movie"]["title"] == "Some Home Video"
     assert client.get("/api/matches").json()["rows"] == []
 
     ignored = client.post("/api/matches/ignore", json={"film_key": key}).json()
@@ -119,20 +154,47 @@ def test_match_review_flow(client: TestClient, sample_zip: bytes) -> None:
     assert no_candidate.status_code == 400
     accepted = client.post("/api/matches/accept", json={"film_key": arrival["film_key"]}).json()
     assert accepted["status"] == "manual" and accepted["confidence"] == 1.0
+    assert accepted["movie"]["title"] == "Arrival"
+
+
+def test_matches_are_locked_while_processing(client: TestClient, sample_zip: bytes) -> None:
+    upload(client, sample_zip)
+    session = store_of().get(client.headers["X-Session-Id"])
+    assert session is not None
+    session.run.status = "running"
+    resp = client.post("/api/matches/ignore", json={"film_key": make_film_key("Arrival", 2016)})
+    assert resp.status_code == 409
+
+
+def test_fixes_sent_with_the_upload_are_applied(client: TestClient, sample_zip: bytes) -> None:
+    home = make_film_key("Home Movie Night", None)
+    body = upload(client, sample_zip, {home: {"tmdb_id": 777}, "gone|1999": {"ignored": True}})
+    assert body["stats"]["fixes_applied"] == 1
+    assert client.get("/api/matches").json()["rows"] == []
+    row = next(r for r in client.get("/api/matches", params={"filter": "all"}).json()["rows"]
+               if r["film_key"] == home)
+    assert row["status"] == "manual" and row["movie"]["title"] == "Some Home Video"
+
+
+def test_reprocess_after_fixing(client: TestClient, sample_zip: bytes) -> None:
+    upload(client, sample_zip)
+    first = client.get("/api/session").json()["run"]
+    home = make_film_key("Home Movie Night", None)
+    client.post("/api/matches/set", json={"film_key": home, "tmdb_ref": "777"})
+    out = client.post("/api/session/reprocess").json()
+    assert out["run"]["id"] == first["id"] + 1 and out["run"]["status"] == "done"
+    assert out["run"]["stats"]["matching"]["matched"] == 0  # only unresolved films are re-matched
+    assert 777 in library_of(client).own_ids()
 
 
 def test_recommendations(client: TestClient, sample_zip: bytes) -> None:
-    before = client.get("/api/recommendations").json()
-    assert before["ready"] is False and "taste model" in before["message"]
-
     upload(client, sample_zip)
     body = client.get("/api/recommendations", params={"limit": 100}).json()
     assert body["ready"] is True
     items = body["items"]
     titles = {i["title"] for i in items}
 
-    watched = {f["tmdb_id"] for f in client.get("/api/films").json() if f["watched"]}
-    assert not watched & {i["tmdb_id"] for i in items}
+    assert not library_of(client).seen_ids() & {i["tmdb_id"] for i in items}
     assert {"Contact", "Solaris", "Enemy", "Annihilation", "Chungking Express"} <= titles
     assert "Obscure Short" not in titles  # filtered by candidate_min_votes
     past_lives = next(i for i in items if i["title"] == "Past Lives")
@@ -184,7 +246,6 @@ def test_recommendations_without_collab_model(client: TestClient, sample_zip: by
 
 
 def test_taste_endpoint(client: TestClient, sample_zip: bytes) -> None:
-    assert client.get("/api/taste").json()["ready"] is False
     upload(client, sample_zip)
     taste = client.get("/api/taste").json()
     assert taste["ready"] and taste["n_rated"] == 28  # every rated film matched
@@ -192,6 +253,13 @@ def test_taste_endpoint(client: TestClient, sample_zip: bytes) -> None:
     # finds must respect the minimum cluster size.
     assert len(taste["clusters"]) <= 6
     assert all(c["size"] >= 3 and c["examples"] for c in taste["clusters"])
+
+
+def test_not_ready_without_a_taste_model(keyless_client: TestClient, sample_zip: bytes) -> None:
+    upload(keyless_client, sample_zip)  # no TMDB: nothing matched, so no taste model
+    assert keyless_client.get("/api/taste").json()["ready"] is False
+    rec = keyless_client.get("/api/recommendations").json()
+    assert rec["ready"] is False and "taste model" in rec["message"]
 
 
 def test_recommendation_filters(client: TestClient, sample_zip: bytes) -> None:
@@ -224,56 +292,11 @@ def test_recommendation_filters(client: TestClient, sample_zip: bytes) -> None:
     assert client.get("/api/recommendations", params={"min_rating": 11}).status_code == 422
 
 
-def _snapshot(c: TestClient) -> dict[str, object]:
-    films = sorted(
-        (f["film_key"], f["tmdb_id"], f["match_status"], f["rating"], f["watched"])
-        for f in c.get("/api/films").json()
-    )
-    recs = c.get("/api/recommendations", params={"limit": 200}).json()
-    taste = c.get("/api/taste").json()
-    return {
-        "films": films,
-        "recs": [(i["tmdb_id"], round(i["score"], 9), i["candidate_sources"]) for i in recs["items"]],
-        "total": recs["total"],
-        "taste": (taste["n_rated"], [(cl["label"], cl["size"]) for cl in taste["clusters"]]),
-    }
-
-
-def test_other_account_upload_equals_fresh_install(engine: Engine, tmp_path: Path, sample_zip: bytes) -> None:
-    """Uploading someone else's export leaves exactly the state a fresh install
-    would have after uploading it: nothing from the previous account survives."""
-    other_zip = build_zip(build_files(username="someoneelse", watched=WATCHED[:12]))
-
-    (tmp_path / "fresh").mkdir()
-    fresh_engine = make_engine(tmp_path / "fresh" / "db.sqlite3")
-    def tmdb() -> FakeTmdb:
-        fake = fake_for_sample()
-        fake.movies[777] = movie(777, "Some Home Video", 2004)  # target of the manual fix below
-        return fake
-
-    with make_client(fresh_engine, tmdb()) as fresh:
-        upload(fresh, other_zip)
-        expected = _snapshot(fresh)
-    app.dependency_overrides.clear()
-
-    with make_client(engine, tmdb()) as c:
-        upload(c, sample_zip)
-        arrival = next(f for f in c.get("/api/films").json() if f["name"] == "Arrival")  # in both exports
-        fixed = c.post("/api/matches/set", json={"film_key": arrival["film_key"], "tmdb_ref": "777"}).json()
-        assert fixed["status"] == "manual"
-
-        body = upload(c, other_zip)
-        assert body["stats"]["reset"] is True
-        assert _snapshot(c) == expected
-    app.dependency_overrides.clear()
-
-
-def test_every_eligible_film_is_scored(client: TestClient, engine: Engine, sample_zip: bytes) -> None:
+def test_every_eligible_film_is_scored(client: TestClient, sample_zip: bytes) -> None:
     """No nearest-neighbour cutoff: every unseen candidate or watchlist film gets
     a score, however far it is from the taste vectors."""
     upload(client, sample_zip)
-    with Session(engine) as s:
-        eligible = current_film_ids(s) - {f.tmdb_id for f in s.exec(select(UserFilm)) if f.watched}
+    eligible = library_of(client).eligible_ids()
     body = client.get("/api/recommendations", params={"limit": 200}).json()
     assert body["total"] == len(eligible) > 0
     assert {i["tmdb_id"] for i in body["items"]} == eligible
@@ -304,7 +327,6 @@ def test_omdb_ratings_and_filters(engine: Engine, sample_zip: bytes) -> None:
 
 
 def test_metrics(client: TestClient, sample_zip: bytes) -> None:
-    assert client.get("/api/metrics").json()["ready"] is False
     upload(client, sample_zip)
     m = client.get("/api/metrics").json()
     assert m["ready"] and m["mode"] == "fixed" and m["n_ratings"] == 28  # < 50: fixed weights
@@ -315,3 +337,66 @@ def test_metrics(client: TestClient, sample_zip: bytes) -> None:
     assert m["partial"]["features"] == ["profile", "embedding", "votes"]
     assert m["collab_model"] is None and m["omdb"]["enabled"] is False
     assert m["candidates"]["total"] > 0 and sum(m["candidates"]["by_source"].values()) > 0
+
+
+# ---------------------------------------------------------------- sessions and privacy
+
+
+def test_sessions_are_isolated(client: TestClient, sample_zip: bytes) -> None:
+    upload(client, sample_zip)
+    before = client.get("/api/recommendations", params={"limit": 200}).json()["items"]
+
+    other = TestClient(app)
+    upload(other, build_zip(build_files(username="someoneelse", watched=WATCHED[:12])))
+    assert other.headers["X-Session-Id"] != client.headers["X-Session-Id"]
+    theirs = {r["film_key"] for r in other.get("/api/matches", params={"filter": "all"}).json()["rows"]}
+    mine = {r["film_key"] for r in client.get("/api/matches", params={"filter": "all"}).json()["rows"]}
+    assert theirs < mine
+
+    # Another user's upload, fix or deletion never changes this session.
+    other.post("/api/matches/ignore", json={"film_key": make_film_key("Arrival", 2016)})
+    other.delete("/api/session")
+    after = client.get("/api/recommendations", params={"limit": 200}).json()["items"]
+    assert [(i["tmdb_id"], i["score"]) for i in after] == [(i["tmdb_id"], i["score"]) for i in before]
+    assert library_of(client).films[make_film_key("Arrival", 2016)].match_status == "matched"
+
+
+def test_delete_session(client: TestClient, sample_zip: bytes) -> None:
+    upload(client, sample_zip)
+    assert client.delete("/api/session").json() == {"deleted": True}
+    assert client.get("/api/recommendations").status_code == 410
+    assert client.delete("/api/session").json() == {"deleted": False}
+    assert len(store_of()) == 0
+
+
+def test_nothing_about_the_user_is_stored(client: TestClient, engine: Engine, sample_zip: bytes, tmp_path: Path) -> None:
+    upload(client, sample_zip)
+    client.post("/api/matches/set", json={"film_key": make_film_key("Home Movie Night", None), "tmdb_ref": "777"})
+    client.post("/api/session/reprocess")
+    client.delete("/api/session")
+
+    assert set(inspect(engine).get_table_names()) == {"apicache", "movie"}
+    # data_dir is tmp_path: only the shared film database is on disk, no model files.
+    stored = {p.name for p in tmp_path.rglob("*") if p.is_file()}
+    assert stored <= {"test.sqlite3", "test.sqlite3-wal", "test.sqlite3-shm"}
+
+
+def test_upload_limits(engine: Engine, sample_zip: bytes) -> None:
+    with make_client(engine, fake_for_sample()) as c:
+        store = store_of()
+        store.settings.max_export_films = 10
+        resp = c.post("/api/sessions", files={"file": ("e.zip", sample_zip, "application/zip")})
+        assert resp.status_code == 413 and "35 films" in resp.json()["detail"]
+        store.settings.max_export_films = 5000
+
+        store.settings.max_sessions = 1
+        upload(c, sample_zip)
+        busy = TestClient(app).post("/api/sessions", files={"file": ("e.zip", sample_zip, "application/zip")})
+        assert busy.status_code == 503
+        store.settings.max_sessions = 20
+
+        store.settings.uploads_per_ip_per_hour = 4  # 3 used above
+        upload(c, sample_zip)
+        limited = c.post("/api/sessions", files={"file": ("e.zip", sample_zip, "application/zip")})
+        assert limited.status_code == 429
+    app.dependency_overrides.clear()

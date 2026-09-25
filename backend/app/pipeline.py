@@ -1,19 +1,19 @@
-"""Background ingestion pipeline:
-matching → enrichment → candidates → embedding → taste model → collaborative model.
+"""The recommendation pipeline for one user's library:
+matching → enrichment → collab → candidates → embedding → taste → blend → omdb.
 
-Incremental by construction:
-  * matching only touches new films (`match_status` None) and earlier TMDB
-    errors, so manual fixes and settled results are never redone;
+The library (films, candidates, models) lives in memory and is dropped with its
+session. Everything learned about *films* is shared and persisted, so each user
+makes the next one cheaper:
+  * every TMDB/OMDb response is cached (`ApiCache`), so a search, list or
+    lookup another user already triggered costs no request;
   * enrichment only fetches TMDB ids that have no `Movie` row yet;
-  * candidate enrichment likewise only fetches unknown ids;
-  * embedding only re-embeds films whose document hash changed;
-  * every HTTP response is cached, so even a forced redo is network-free.
+  * embedding only embeds films whose document isn't in the shared index;
+  * the MovieLens model is trained once and each user is folded in on the fly.
 """
 
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from datetime import datetime, timedelta, timezone
 from collections.abc import Callable
@@ -26,17 +26,19 @@ from sqlalchemy import Engine
 from sqlmodel import Session, col, select
 
 from app import matching
-from app.blend import BlendModel, fit_blend, fixed_model, inputs_fingerprint, out_of_fold
+from app.blend import BlendModel, fit_blend, fixed_model, out_of_fold
 from app.cache import ApiError, DailyBudgetExceeded, ResponseCache
 from app.collab import MFModel, TrainParams, load_scorer, train_als
 from app.config import Settings, get_settings
-from app.db import Candidate, IngestRun, Movie, UserFilm, get_engine, utcnow
+from app.db import Movie, get_engine, purge_user_data, utcnow
 from app.embeddings import Embedder, SentenceTransformerEmbedder, build_document, doc_hash
+from app.library import Library
 from app.movielens import MovieLensError, download_dataset, is_downloaded, load_dataset
-from app.profile import TasteProfile, load_profile, user_ratings
+from app.profile import TasteProfile, load_profile
 from app.omdb import OmdbClient, OmdbRatings
-from app.recommend import RecFilters, RecResult, current_film_ids, eligible_ids, recommend
-from app.taste import TasteModel, build_taste_model
+from app.recommend import RecFilters, RecResult, recommend
+from app.sessions import RunState, UserSession
+from app.taste import build_taste_model
 from app.tmdb import TmdbClient, fetch_movie
 from app.vectorstore import ChromaStore, Metadata, VectorStore
 
@@ -44,6 +46,8 @@ log = logging.getLogger(__name__)
 
 STAGES = ["parsing", "matching", "enrichment", "collab", "candidates", "embedding", "taste", "blend", "omdb"]
 PROGRESS_FLUSH_SECONDS = 0.5
+# Index metadata that described one user's library; stripped at startup.
+LEGACY_INDEX_KEYS = ("seen",)
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -59,6 +63,10 @@ class TmdbUnavailable(ServiceUnavailable):
 
 class OmdbUnavailable(ServiceUnavailable):
     pass
+
+
+class RunCancelled(RuntimeError):
+    """The session was deleted or expired mid-run."""
 
 
 class Pipeline:
@@ -81,57 +89,42 @@ class Pipeline:
         self.max_workers = max_workers
         self.movielens_transport = movielens_transport  # tests inject a fake
         self.omdb = omdb
-        self._lock = threading.Lock()
 
     # ------------------------------------------------------------ run control
 
-    def try_acquire(self) -> bool:
-        return self._lock.acquire(blocking=False)
+    def purge_user_data(self) -> list[str]:
+        """Remove user data that older versions stored (tables, model files, the
+        index's `seen` flags). Idempotent; call at startup."""
+        removed = purge_user_data(self.engine, self.settings.data_dir)
+        if self.store is not None and (n := self.store.strip_metadata_keys(LEGACY_INDEX_KEYS)):
+            log.warning("removed per-user flags from %d index entries", n)
+            removed.append(f"index flags ({n})")
+        return removed
 
-    def release(self) -> None:
-        self._lock.release()
+    def run_session(self, session: UserSession) -> None:
+        self.run(session.library, session.run)
 
-    @property
-    def busy(self) -> bool:
-        return self._lock.locked()
-
-    def fail_interrupted_runs(self) -> int:
-        """Mark runs a previous process left `running` as failed, so the UI stops
-        polling them and offers to resume. The lock lives in memory, so they died
-        with that process (a deploy, a crash, a stopped machine). Call at startup."""
-        if self.busy:
-            return 0
-        with Session(self.engine) as s:
-            stale = s.exec(select(IngestRun).where(IngestRun.status == "running")).all()
-            for run in stale:
-                run.status, run.finished_at = "error", utcnow()
-                run.message = "Interrupted: the server restarted before processing finished."
-                s.add(run)
-            s.commit()
-        if stale:
-            log.warning("marked %d interrupted run(s) as failed", len(stale))
-        return len(stale)
-
-    def run(self, run_id: int) -> None:
-        """Run all post-parse stages for `run_id`. Caller must hold the lock."""
+    def run(self, lib: Library, run: RunState) -> None:
+        """Run every stage for `lib`, recording progress and the outcome on `run`."""
         try:
-            self._run(run_id)
+            self._run(lib, run)
+        except RunCancelled:
+            self._update(run, status="cancelled", finished_at=utcnow())
         except Exception as exc:  # noqa: BLE001 — record any failure on the run
-            log.exception("pipeline run %s failed", run_id)
-            self._update(run_id, status="error", message=str(exc), finished_at=utcnow())
-        finally:
-            self.release()
+            log.exception("pipeline run failed")
+            self._update(run, status="error", message=str(exc), finished_at=utcnow())
 
-    def _run(self, run_id: int) -> None:
+    def _run(self, lib: Library, run: RunState) -> None:
         stats: dict[str, object] = {}
         messages: list[str] = []
         if self.tmdb is not None:
-            stats["matching"] = self.match_pending(run_id)
-            stats["enrichment"] = self.enrich_pending(run_id)
+            stats["matching"] = self.match_pending(lib, run)
+            stats["enrichment"] = self.enrich_pending(lib, run)
 
         # Before candidates, which use score ③'s top predictions as a source.
+        self._check(run)
         try:
-            stats["collab"] = self.train_collab(run_id)
+            stats["collab"] = self.train_collab(run)
         except MovieLensError as exc:
             # Score ③ is optional: recommendations still work from ① and ②.
             messages.append(f"collaborative score unavailable: {exc}")
@@ -142,51 +135,48 @@ class Pipeline:
             messages.append("TMDB_API_KEY not set: matching, enrichment and candidates skipped")
             log.warning(messages[-1])
         else:
-            stats["candidates"] = self.generate_candidates(run_id)
+            stats["candidates"] = self.generate_candidates(lib, run)
 
         if self.embedder is None or self.store is None:
             messages.append("no embedder/vector store configured: embedding skipped")
             log.warning(messages[-1])
         else:
-            stats["embedding"] = self.embed_pending(run_id)
-            stats["taste"] = self.build_taste(run_id)
-            stats["blend"] = self.fit_blend_model(run_id)
+            stats["embedding"] = self.embed_pending(lib, run)
+            stats["taste"] = self.build_taste(lib, run)
+            stats["blend"] = self.fit_blend_model(lib, run)
+            self._check(run)
             try:
-                stats["omdb"] = self.fetch_omdb(run_id)
+                stats["omdb"] = self.fetch_omdb(lib, run)
             except OmdbUnavailable as exc:
                 # OMDb answers 401 both for a bad key and for "Request limit reached!".
                 stats["omdb"] = {"skipped": str(exc)}
                 messages.append(f"OMDb ratings skipped: {exc}")
                 log.warning(messages[-1])
             if "budget_exhausted" in stats["omdb"]:
-                messages.append("OMDb daily request budget reached: the rest of the shortlist is looked up next run")
+                messages.append("OMDb daily request budget reached: some ratings are missing until tomorrow")
 
-        with Session(self.engine) as s:
-            run = s.get(IngestRun, run_id)
-            assert run is not None
-            run.stats = {**run.stats, **stats}
-            run.stage, run.status, run.finished_at = "done", "done", utcnow()
-            run.message = "; ".join(messages) or None
-            s.add(run)
-            s.commit()
+        self._update(
+            run, stats={**run.stats, **stats}, stage="done", status="done",
+            finished_at=utcnow(), message="; ".join(messages) or None,
+        )
 
     # ------------------------------------------------------------ helpers
 
-    def _update(self, run_id: int | None, **fields: object) -> None:
-        if run_id is None:  # CLI `train` runs outside an ingest run
+    @staticmethod
+    def _update(run: RunState | None, **fields: object) -> None:
+        if run is None:  # CLI `train` runs outside a session
             return
-        with Session(self.engine) as s:
-            run = s.get(IngestRun, run_id)
-            if run is None:
-                return
-            for k, v in fields.items():
-                setattr(run, k, v)
-            s.add(run)
-            s.commit()
+        for k, v in fields.items():
+            setattr(run, k, v)
+
+    @staticmethod
+    def _check(run: RunState | None) -> None:
+        if run is not None and run.cancelled:
+            raise RunCancelled()
 
     def _parallel(
         self,
-        run_id: int,
+        run: RunState | None,
         stage: str,
         items: list[T],
         work: Callable[[T], R],
@@ -194,11 +184,11 @@ class Pipeline:
         unauthorized: type[ServiceUnavailable] = TmdbUnavailable,
     ) -> None:
         """Run `work` over items in a thread pool; apply results on this thread.
-        A 401 cancels the rest and raises `unauthorized`."""
-        self._update(run_id, stage=stage, progress_done=0, progress_total=len(items))
+        A 401 cancels the rest and raises `unauthorized`; so does the session ending."""
+        self._check(run)
+        self._update(run, stage=stage, progress_done=0, progress_total=len(items))
         if not items:
             return
-        last_flush = time.monotonic()
         with ThreadPoolExecutor(self.max_workers) as pool, Session(self.engine) as s:
             futures: dict[Future[R], T] = {pool.submit(work, it): it for it in items}
             for done, fut in enumerate(as_completed(futures), start=1):
@@ -209,30 +199,30 @@ class Pipeline:
                         f.cancel()
                     service = "OMDb" if unauthorized is OmdbUnavailable else "TMDB"
                     raise unauthorized(f"{service} rejected the request (HTTP 401): {exc}") from exc
+                if run is not None and run.cancelled:
+                    for f in futures:
+                        f.cancel()
+                    raise RunCancelled()
                 on_done(s, item, None if exc else fut.result(), exc)
                 # Commit per item: an open write transaction here would hold
                 # SQLite's lock and block workers writing to the HTTP cache.
                 s.commit()
-                if done == len(items) or time.monotonic() - last_flush > PROGRESS_FLUSH_SECONDS:
-                    self._update(run_id, progress_done=done)
-                    last_flush = time.monotonic()
+                self._update(run, progress_done=done)
 
     # ------------------------------------------------------------ stages
 
-    def match_pending(self, run_id: int) -> dict[str, int]:
+    def match_pending(self, lib: Library, run: RunState | None = None) -> dict[str, int]:
+        """Match films that have no result yet (or had a TMDB error). Fixed films
+        (manual/ignored) are skipped. Searches are cached, so a title another
+        user already matched costs no request."""
         assert self.tmdb is not None
         tmdb = self.tmdb
         threshold = self.settings.match_low_confidence_threshold
-        with Session(self.engine) as s:
-            pending = [
-                (f.film_key, f.name, f.year)
-                for f in s.exec(
-                    select(UserFilm).where(
-                        col(UserFilm.match_status).is_(None)
-                        | (col(UserFilm.match_status) == matching.ERROR)
-                    )
-                )
-            ]
+        pending = [
+            (f.film_key, f.name, f.year)
+            for f in lib.films.values()
+            if f.match_status is None or f.match_status == matching.ERROR
+        ]
         outcomes = (matching.MATCHED, matching.LOW_CONFIDENCE, matching.UNMATCHED, matching.ERROR)
         stats = dict.fromkeys(outcomes, 0)
 
@@ -241,16 +231,14 @@ class Pipeline:
             return matching.match_film(tmdb, name, year, threshold)
 
         def on_done(
-            s: Session,
+            _s: Session,
             item: tuple[str, str, int | None],
             result: matching.MatchResult | None,
             exc: Exception | None,
         ) -> None:
-            film = s.get(UserFilm, item[0])
-            if film is None:
-                return
+            film = lib.films[item[0]]
             if result is None:
-                log.error("matching %r failed: %s", film.name, exc)
+                log.error("a TMDB search failed: %s", exc)
                 film.match_status, film.match_note = matching.ERROR, f"TMDB error: {exc}"
             else:
                 film.tmdb_id = result.tmdb_id
@@ -258,31 +246,26 @@ class Pipeline:
                 film.match_status = result.status
                 film.match_note = result.note
             stats[film.match_status] += 1
-            s.add(film)
 
-        self._parallel(run_id, "matching", pending, work, on_done)
+        self._parallel(run, "matching", pending, work, on_done)
         log.info("matching done: %s", stats)
         return stats
 
-    def enrich_pending(self, run_id: int) -> dict[str, int]:
+    def enrich_pending(self, lib: Library, run: RunState | None = None) -> dict[str, int]:
         """Fetch TMDB metadata for the user's matched films."""
-        with Session(self.engine) as s:
-            wanted = {
-                i
-                for i in s.exec(select(UserFilm.tmdb_id).where(col(UserFilm.tmdb_id).is_not(None)))
-                if i is not None
-            }
-        return self._enrich_ids(run_id, "enrichment", wanted, mark_user_films=True)
+        return self._enrich_ids(run, "enrichment", lib.own_ids(), lib)
 
     def _enrich_ids(
-        self, run_id: int, stage: str, wanted: set[int], mark_user_films: bool
+        self, run: RunState | None, stage: str, wanted: set[int], lib: Library | None
     ) -> dict[str, int]:
+        """Fetch metadata for ids without a `Movie` row. With `lib`, films whose
+        lookup failed are marked for review (unless the user set them)."""
         assert self.tmdb is not None
         tmdb = self.tmdb
         with Session(self.engine) as s:
-            have = set(s.exec(select(Movie.tmdb_id)).all())
+            have = set(s.exec(select(Movie.tmdb_id).where(col(Movie.tmdb_id).in_(wanted))).all())
         pending = sorted(wanted - have)
-        stats = {"enriched": 0, "not_found": 0, "errors": 0, "already_had": len(wanted & have)}
+        stats = {"enriched": 0, "not_found": 0, "errors": 0, "already_had": len(have)}
 
         def on_done(s: Session, tmdb_id: int, movie: Movie | None, exc: Exception | None) -> None:
             if movie is not None:
@@ -292,19 +275,18 @@ class Pipeline:
             stats["errors" if exc else "not_found"] += 1
             note = f"enrichment failed: {exc}" if exc else f"TMDB id {tmdb_id} not found"
             log.error("tmdb %s: %s", tmdb_id, note)
-            if not mark_user_films:
+            if lib is None:
                 return
-            for film in s.exec(select(UserFilm).where(UserFilm.tmdb_id == tmdb_id)):
-                if film.match_status != matching.MANUAL:
+            for film in lib.films.values():
+                if film.tmdb_id == tmdb_id and film.match_status != matching.MANUAL:
                     film.match_status, film.match_note = matching.ERROR, note
-                    s.add(film)
 
-        self._parallel(run_id, stage, pending, lambda i: fetch_movie(tmdb, i), on_done)
+        self._parallel(run, stage, pending, lambda i: fetch_movie(tmdb, i), on_done)
         log.info("%s done: %s", stage, stats)
         return stats
 
-    def generate_candidates(self, run_id: int) -> dict[str, int]:
-        """Build the candidate set from several sources:
+    def generate_candidates(self, lib: Library, run: RunState | None = None) -> dict[str, object]:
+        """Build the library's candidate set from several sources:
 
         - `recommendations:<seed>` / `similar:<seed>`: TMDB lists for the user's
           top-rated films,
@@ -312,27 +294,20 @@ class Pipeline:
           genres and languages the taste profile rates highest,
         - `collab`: score ③'s top predictions among films the user hasn't seen.
 
-        The candidate table is replaced, not appended to: a film stays only while
-        a current source still proposes it, so favourites that are gone (or a
-        previous account's) stop contributing. Sources whose fetch failed this
-        time are kept until the next successful fetch. Films under
-        `candidate_min_votes` are dropped (after enrichment, for sources that
-        don't report vote counts)."""
+        Films under `candidate_min_votes` are dropped (after enrichment, for
+        sources that don't report vote counts)."""
         assert self.tmdb is not None
         tmdb = self.tmdb
         cfg = self.settings
+        ratings = lib.ratings()
+        seen = lib.seen_ids()
+        liked = {tid: r for tid, r in ratings.items() if r >= cfg.candidate_seed_min_rating}
         with Session(self.engine) as s:
-            rows = s.exec(
-                select(UserFilm.tmdb_id, UserFilm.rating, Movie.vote_count)
-                .join(Movie, col(Movie.tmdb_id) == col(UserFilm.tmdb_id))
-                .where(col(UserFilm.rating) >= cfg.candidate_seed_min_rating)
-            ).all()
-            seen = self._seen_ids(s)
-            profile = load_profile(s, cfg.shrinkage_k)
-            ratings = user_ratings(s)
+            votes = dict(s.exec(select(Movie.tmdb_id, Movie.vote_count).where(col(Movie.tmdb_id).in_(liked))).all())
+            profile = load_profile(s, ratings, cfg.shrinkage_k)
         # Highest-rated first; among equals, better-known films make better seeds.
-        ranked = sorted(rows, key=lambda r: (-(r[1] or 0), -(r[2] or 0)))
-        seeds = list(dict.fromkeys(r[0] for r in ranked if r[0] is not None))[: cfg.candidate_seed_count]
+        ranked = sorted((tid for tid in liked if tid in votes), key=lambda t: (-liked[t], -(votes[t] or 0)))
+        seeds = ranked[: cfg.candidate_seed_count]
 
         # Each job returns (source, tmdb_id, vote_count or None if unknown).
         Hit = tuple[str, int, int | None]
@@ -365,60 +340,34 @@ class Pipeline:
                 log.error("candidate source %s failed: %s", key, exc)
                 failed.add(key)
                 return
-            for source, tid, votes in hits:
+            for source, tid, n_votes in hits:
                 if tid in seen:
                     continue
-                if votes is not None and votes < cfg.candidate_min_votes:
+                if n_votes is not None and n_votes < cfg.candidate_min_votes:
                     skipped_low_votes += 1
                     continue
                 found.setdefault(tid, set()).add(source)
                 kind = source.split(":", 1)[0]
                 per_source[kind] = per_source.get(kind, 0) + 1
 
-        self._parallel(run_id, "candidates", list(jobs), lambda key: jobs[key](), on_done)
-
-        with Session(self.engine) as s:
-            existing = {c.tmdb_id: c for c in s.exec(select(Candidate))}
-            new = removed = 0
-            for tid, cand in existing.items():
-                kept = {src for src in cand.sources if _source_job(src) in failed}
-                sources = found.get(tid, set()) | kept
-                if not sources:
-                    s.delete(cand)
-                    removed += 1
-                elif sources != set(cand.sources):
-                    cand.sources = sorted(sources)
-                    cand.updated_at = utcnow()
-                    s.add(cand)
-            for tid, sources in found.items():
-                if tid not in existing:
-                    s.add(Candidate(tmdb_id=tid, sources=sorted(sources)))
-                    new += 1
-            s.commit()
-            all_ids = set(s.exec(select(Candidate.tmdb_id)).all())
-
-        enrich = self._enrich_ids(run_id, "candidates", all_ids, mark_user_films=False)
+        self._parallel(run, "candidates", list(jobs), lambda key: jobs[key](), on_done)
+        enrich = self._enrich_ids(run, "candidates", set(found), None)
 
         # Sources without vote counts (collab) are checked now that details are in.
         with Session(self.engine) as s:
-            thin = s.exec(
-                select(Candidate)
-                .join(Movie, col(Movie.tmdb_id) == col(Candidate.tmdb_id))
-                .where(col(Movie.vote_count) < cfg.candidate_min_votes)
-            ).all()
-            for cand in thin:
-                s.delete(cand)
-            s.commit()
-            total = len(s.exec(select(Candidate.tmdb_id)).all())
+            thin = set(s.exec(
+                select(Movie.tmdb_id).where(
+                    col(Movie.tmdb_id).in_(found), col(Movie.vote_count) < cfg.candidate_min_votes
+                )
+            ).all())
+        lib.candidates = {tid: sorted(srcs) for tid, srcs in found.items() if tid not in thin}
         stats = {
             "seeds": len(seeds),
             "sources": len(jobs),
             "found": len(found),
             "by_source": per_source,
-            "new": new,
-            "removed": removed + len(thin),
             "failed_sources": len(failed),
-            "total": total,
+            "total": len(lib.candidates),
             "skipped_low_votes": skipped_low_votes + len(thin),
             "enriched": enrich["enriched"],
             "enrich_errors": enrich["errors"] + enrich["not_found"],
@@ -482,36 +431,18 @@ class Pipeline:
 
     # ------------------------------------------------------------ embeddings
 
-    @staticmethod
-    def _seen_ids(s: Session) -> set[int]:
-        return {
-            i
-            for i in s.exec(
-                select(UserFilm.tmdb_id).where(
-                    col(UserFilm.watched).is_(True), col(UserFilm.tmdb_id).is_not(None)
-                )
-            )
-            if i is not None
-        }
-
-    def embed_pending(self, run_id: int) -> dict[str, int]:
-        """Embed films whose document changed; keep the `seen` flag in sync; drop
-        films that no longer belong to this user's library or candidates."""
+    def embed_pending(self, lib: Library, run: RunState | None = None) -> dict[str, int]:
+        """Embed the library's films and candidates that aren't in the shared
+        index yet (or whose document changed). The index only holds film data,
+        so it's never pruned: another user's films make later runs cheaper."""
         assert self.embedder is not None and self.store is not None
         embedder, store = self.embedder, self.store
         max_reviews = self.settings.doc_max_reviews
+        relevant = lib.current_ids()
         with Session(self.engine) as s:
-            # Only the user's films and current candidates are indexed; other
-            # `movie` rows stay as a metadata cache for if they become relevant again.
-            relevant = current_film_ids(s)
             movies = list(s.exec(select(Movie).where(col(Movie.tmdb_id).in_(relevant))))
-            seen = self._seen_ids(s)
 
-        existing = store.get_metadata()
-        stale = sorted(set(existing) - relevant)
-        if stale:
-            store.delete(stale)
-            log.info("removed %d films from the index that no longer belong to this library", len(stale))
+        existing = store.get_metadata(relevant)
         docs: dict[int, str] = {}
         metas: dict[int, Metadata] = {}
         for m in movies:
@@ -521,7 +452,6 @@ class Pipeline:
                 "tmdb_id": m.tmdb_id,
                 "title": m.title,
                 "genres": "|".join(m.genres),
-                "seen": m.tmdb_id in seen,
                 "doc_hash": doc_hash(doc, embedder.model_name),
             }
             if m.year is not None:
@@ -529,39 +459,34 @@ class Pipeline:
             metas[m.tmdb_id] = meta
 
         to_embed = [i for i, meta in metas.items() if existing.get(i, {}).get("doc_hash") != meta["doc_hash"]]
-        seen_changed = [
-            i for i, meta in metas.items()
-            if i not in to_embed and existing.get(i, {}).get("seen") != meta["seen"]
-        ]
-        self._update(run_id, stage="embedding", progress_done=0, progress_total=len(to_embed))
+        self._check(run)
+        self._update(run, stage="embedding", progress_done=0, progress_total=len(to_embed))
 
         batch = self.settings.embedding_batch_size
         for start in range(0, len(to_embed), batch):
+            self._check(run)
             ids = to_embed[start : start + batch]
             vecs = embedder.embed([docs[i] for i in ids])
             store.upsert(ids, vecs, [metas[i] for i in ids], [docs[i] for i in ids])
-            self._update(run_id, progress_done=min(start + batch, len(to_embed)))
-        if seen_changed:
-            store.update_metadata(seen_changed, [{"seen": metas[i]["seen"]} for i in seen_changed])
+            self._update(run, progress_done=min(start + batch, len(to_embed)))
 
         stats = {
             "embedded": len(to_embed),
             "unchanged": len(metas) - len(to_embed),
-            "seen_flag_updates": len(seen_changed),
-            "removed": len(stale),
             "index_size": store.count(),
         }
         log.info("embedding done: %s", stats)
         return stats
 
-    def build_taste(self, run_id: int) -> dict[str, object]:
+    def build_taste(self, lib: Library, run: RunState | None = None) -> dict[str, object]:
         assert self.embedder is not None and self.store is not None
-        self._update(run_id, stage="taste", progress_done=0, progress_total=0)
+        self._check(run)
+        self._update(run, stage="taste", progress_done=0, progress_total=0)
+        ratings = lib.ratings()
         with Session(self.engine) as s:
-            ratings = user_ratings(s)
-            genres = {m.tmdb_id: m.genres for m in s.exec(select(Movie))}
+            genres = {m.tmdb_id: m.genres for m in s.exec(select(Movie).where(col(Movie.tmdb_id).in_(ratings)))}
 
-        model = build_taste_model(
+        lib.taste = build_taste_model(
             ratings,
             self.store.get_embeddings(ratings),
             genres,
@@ -570,45 +495,33 @@ class Pipeline:
             min_cluster_size=self.settings.taste_cluster_min_size,
             embedding_model=self.embedder.model_name,
         )
-        path = self.settings.taste_model_path
-        if model is None:
-            path.unlink(missing_ok=True)
+        if lib.taste is None:
             return {"built": False}
-        model.save(path)
         return {
             "built": True,
-            "rated": model.n_rated,
-            "clusters": len(model.clusters),
-            "silhouette": model.silhouette,
+            "rated": lib.taste.n_rated,
+            "clusters": len(lib.taste.clusters),
+            "silhouette": lib.taste.silhouette,
         }
 
-    def load_taste(self) -> TasteModel | None:
-        return TasteModel.load(self.settings.taste_model_path)
-
-    def discard_user_models(self) -> None:
-        """Another account's export replaced the data: drop the old taste and blend
-        models so they're never served for the new account, even if this run fails."""
-        self.settings.taste_model_path.unlink(missing_ok=True)
-        self.settings.blend_model_path.unlink(missing_ok=True)
-
     def recommend(
-        self, session: Session, *, limit: int, filters: RecFilters | None = None, mmr: bool = True
+        self, lib: Library, session: Session, *, limit: int, filters: RecFilters | None = None, mmr: bool = True
     ) -> tuple[RecResult, BlendModel] | None:
         """Everything the recommendation list needs, wired from settings. None
-        until there's a taste model and a vector store."""
-        taste = self.load_taste()
-        if taste is None or self.store is None:
+        until the library has a taste model and there's a vector store."""
+        if lib.taste is None or self.store is None:
             return None
         cfg = self.settings
-        blend = self.load_blend()
+        blend = lib.blend or fixed_model(cfg)
         result = recommend(
             session,
             self.store,
-            taste,
+            lib,
+            lib.taste,
             limit=limit,
             mode=cfg.embedding_score_mode,
             filters=filters,
-            profile=load_profile(session, cfg.shrinkage_k),
+            profile=load_profile(session, lib.ratings(), cfg.shrinkage_k),
             feature_weights=cfg.feature_weights,
             reasons_per_film=cfg.profile_reasons_per_film,
             min_reason_stars=cfg.profile_min_reason_stars,
@@ -622,14 +535,15 @@ class Pipeline:
         )
         return result, blend
 
-    def fetch_omdb(self, run_id: int | None) -> dict[str, object]:
-        """IMDb / Rotten Tomatoes / Metacritic for the top `omdb_shortlist_size`
-        films by blended score, skipping any looked up within the cache TTL."""
+    def fetch_omdb(self, lib: Library, run: RunState | None = None) -> dict[str, object]:
+        """IMDb / Rotten Tomatoes / Metacritic for the library's top
+        `omdb_shortlist_size` films, skipping any looked up within the cache TTL
+        (by any user: the ratings are stored on the shared `Movie` rows)."""
         if self.omdb is None:
             return {"skipped": "OMDB_API_KEY not set"}
         omdb, cfg = self.omdb, self.settings
         with Session(self.engine) as s:
-            out = self.recommend(s, limit=cfg.omdb_shortlist_size, mmr=False)
+            out = self.recommend(lib, s, limit=cfg.omdb_shortlist_size, mmr=False)
             shortlist = [r.tmdb_id for r in out[0].items] if out else []
             movies = s.exec(select(Movie).where(col(Movie.tmdb_id).in_(shortlist))).all()
         fresh_after = utcnow() - timedelta(seconds=cfg.cache_ttl_omdb) if cfg.cache_ttl_omdb else None
@@ -660,41 +574,28 @@ class Pipeline:
             stats["fetched"] += 1
             stats["with_ratings"] += any(v is not None for v in (got.imdb_rating, got.rt_score, got.metacritic))
 
-        self._parallel(run_id, "omdb", todo, lambda item: omdb.ratings(item[1]), on_done, OmdbUnavailable)
+        self._parallel(run, "omdb", todo, lambda item: omdb.ratings(item[1]), on_done, OmdbUnavailable)
         if exhausted:
             stats["budget_exhausted"] = exhausted
         stats["already_had"] = len(movies) - len(todo) - stats["no_imdb_id"]
         log.info("omdb done: %s", stats)
         return stats
 
-    def load_blend(self) -> BlendModel:
-        """The fitted blend, or fixed weights if there isn't one yet."""
-        return BlendModel.load(self.settings.blend_model_path) or fixed_model(self.settings)
-
-    def fit_blend_model(self, run_id: int | None) -> dict[str, object]:
-        """Cross-fit ①②③ on the user's ratings and fit the blend (app/blend.py).
-        Skipped when nothing it depends on has changed."""
+    def fit_blend_model(self, lib: Library, run: RunState | None = None) -> dict[str, object]:
+        """Cross-fit ①②③ on the user's ratings and fit the blend (app/blend.py)."""
         assert self.store is not None and self.embedder is not None
         cfg = self.settings
-        self._update(run_id, stage="blend", progress_done=0, progress_total=0)
+        self._check(run)
+        self._update(run, stage="blend", progress_done=0, progress_total=0)
+        ratings = lib.ratings()
+        pool = sorted(lib.eligible_ids())
+        wanted = set(ratings) | set(pool)
         with Session(self.engine) as s:
-            ratings = user_ratings(s)
-            pool = sorted(eligible_ids(s))
-            wanted = set(ratings) | set(pool)
             movies = {m.tmdb_id: m for m in s.exec(select(Movie).where(col(Movie.tmdb_id).in_(wanted)))}
         scorer = load_scorer(cfg.collab_model_path, cfg.collab_min_item_ratings) if cfg.collab_enabled else None
-        fingerprint = inputs_fingerprint(
-            ratings, pool, cfg,
-            [self.embedder.model_name, scorer.model.meta.get("fingerprint", "") if scorer else ""],
-        )
-        existing = BlendModel.load(cfg.blend_model_path)
-        if existing is not None and existing.fingerprint == fingerprint:
-            return {"fitted": False, "mode": existing.mode}
         embeddings = self.store.get_embeddings(wanted)
         rows = out_of_fold(ratings, movies, embeddings, pool, scorer, cfg)
-        model = fit_blend(rows, cfg)
-        model.fingerprint = fingerprint
-        model.save(cfg.blend_model_path)
+        lib.blend = model = fit_blend(rows, cfg)
         learned = model.metrics.get("learned_blend", {})
         return {
             "fitted": True, "mode": model.mode, "ratings": model.n_ratings,
@@ -712,9 +613,9 @@ class Pipeline:
             seed=cfg.collab_seed,
         )
 
-    def train_collab(self, run_id: int | None = None, *, force: bool = False) -> dict[str, object]:
-        """Make sure the MovieLens base model exists and matches the settings.
-        The user is folded in per request, so after the first run this is a no-op."""
+    def train_collab(self, run: RunState | None = None, *, force: bool = False) -> dict[str, object]:
+        """Make sure the MovieLens base model exists and matches the settings. It's
+        shared: users are folded in per request, so after the first run this is a no-op."""
         cfg = self.settings
         if not cfg.collab_enabled:
             return {"skipped": "disabled (COLLAB_ENABLED=false)"}
@@ -724,7 +625,7 @@ class Pipeline:
         if existing is not None and existing.meta.get("fingerprint") == fingerprint and not force:
             return {"trained": False, "val_rmse": existing.meta.get("val_rmse")}
 
-        self._update(run_id, stage="collab", progress_done=0, progress_total=0)
+        self._update(run, stage="collab", progress_done=0, progress_total=0)
         if not is_downloaded(cfg.movielens_dir):
             if not cfg.movielens_auto_download:
                 raise MovieLensError(
@@ -735,7 +636,7 @@ class Pipeline:
             def on_bytes(done: int, total: int) -> None:
                 if time.monotonic() - last[0] >= PROGRESS_FLUSH_SECONDS:
                     last[0] = time.monotonic()
-                    self._update(run_id, progress_done=done // 1024, progress_total=total // 1024)
+                    self._update(run, progress_done=done // 1024, progress_total=total // 1024)
 
             download_dataset(
                 cfg.movielens_dataset, cfg.movielens_root,
@@ -743,10 +644,10 @@ class Pipeline:
             )
 
         data = load_dataset(cfg.movielens_dir)
-        self._update(run_id, progress_done=0, progress_total=params.iterations)
+        self._update(run, progress_done=0, progress_total=params.iterations)
         model = train_als(
             data, params, cfg.movielens_dataset,
-            on_iteration=lambda done, total: self._update(run_id, progress_done=done, progress_total=total),
+            on_iteration=lambda done, total: self._update(run, progress_done=done, progress_total=total),
         )
         model.save(cfg.collab_model_path)
         return {
@@ -759,49 +660,22 @@ class Pipeline:
 
     # ------------------------------------------------------------ manual fixes
 
-    def set_manual_match(self, film_key: str, tmdb_id: int) -> tuple[UserFilm, Movie]:
-        if self.tmdb is None:
-            raise TmdbUnavailable("TMDB_API_KEY not set")
+    def lookup_movie(self, tmdb_id: int) -> Movie:
+        """Metadata for a film the user matched by hand: cached, or fetched and
+        cached. Raises LookupError if TMDB has no such film."""
         with Session(self.engine) as s:
-            film = s.get(UserFilm, film_key)
-            if film is None:
-                raise KeyError(film_key)
-            movie = s.get(Movie, tmdb_id) or fetch_movie(self.tmdb, tmdb_id)
+            movie = s.get(Movie, tmdb_id)
             if movie is None:
-                raise LookupError(f"TMDB id {tmdb_id} not found")
-            movie = s.merge(movie)
-            film.tmdb_id = tmdb_id
-            film.match_status = matching.MANUAL
-            film.match_confidence = 1.0
-            film.match_note = f"manually set to {movie.title!r} ({movie.year or '?'})"
-            s.add(film)
-            s.commit()
-            s.refresh(film)
-            s.refresh(movie)
-            log.info("manual match: %s -> %s", film_key, tmdb_id)
-            return film, movie
-
-    def set_status(self, film_key: str, status: str, note: str) -> UserFilm:
-        with Session(self.engine) as s:
-            film = s.get(UserFilm, film_key)
-            if film is None:
-                raise KeyError(film_key)
-            film.match_status, film.match_note = status, note
-            if status == matching.MANUAL:
-                film.match_confidence = 1.0
-            elif status == matching.IGNORED:
-                film.tmdb_id, film.match_confidence = None, None
-            s.add(film)
-            s.commit()
-            s.refresh(film)
-            return film
-
-
-def _source_job(source: str) -> str:
-    """The fetch that produced a source: "similar:603" → "seed:603"; discover and
-    collab sources are their own job."""
-    kind, _, rest = source.partition(":")
-    return f"seed:{rest}" if kind in ("recommendations", "similar") else source
+                if self.tmdb is None:
+                    raise TmdbUnavailable("TMDB_API_KEY not set")
+                fetched = fetch_movie(self.tmdb, tmdb_id)
+                if fetched is None:
+                    raise LookupError(f"TMDB id {tmdb_id} not found")
+                movie = s.merge(fetched)
+                s.commit()
+                s.refresh(movie)
+            s.expunge(movie)
+            return movie
 
 
 def _as_utc(dt: datetime) -> datetime:

@@ -1,8 +1,10 @@
 """Command-line entry points (used by the Makefile).
 
-    python -m app.cli ingest path/to/letterboxd-export.zip   # parse + run the pipeline
-    python -m app.cli build-index                              # (re)run the pipeline only
-    python -m app.cli train [--force]                          # MovieLens model for score ③
+    python -m app.cli recommend path/to/letterboxd-export.zip [--top N]   # process + print picks
+    python -m app.cli train [--force]                                      # MovieLens model for score ③
+
+`recommend` processes the export in memory, like a web session: only film data
+(the API cache, metadata, embeddings) is kept.
 """
 
 from __future__ import annotations
@@ -14,12 +16,15 @@ from pathlib import Path
 
 from sqlmodel import Session
 
-from app.db import IngestRun, get_engine
-from app.ingest import sync_export
+from app.db import get_engine
 from app.letterboxd import ExportError, parse_export
+from app.library import library_from_export
+from app.sessions import RunState
 
 
-def cmd_ingest(args: argparse.Namespace) -> int:
+def cmd_recommend(args: argparse.Namespace) -> int:
+    from app.pipeline import get_pipeline
+
     path = Path(args.zip)
     if not path.is_file():
         print(f"error: {path} not found", file=sys.stderr)
@@ -29,51 +34,31 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     except ExportError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    with Session(get_engine()) as session:
-        result = sync_export(session, export)
-    if result.reset:
-        from app.pipeline import get_pipeline
-
-        get_pipeline().discard_user_models()
-        print(f"export is from a different account ({export.username}): replaced all data")
     print(f"files: {', '.join(export.files_found)}")
     print(f"films: {len(export.films)} ({len(export.rated)} rated, {len(export.watchlist)} watchlist)")
-    print(f"sync:  {result.summary()}")
     if export.warnings:
         print(f"{len(export.warnings)} warning(s):")
         for w in export.warnings:
             print(f"  - {w}")
-    return run_pipeline()
-
-
-def run_pipeline() -> int:
-    """Run matching → … → taste synchronously. Incremental: cheap when nothing changed."""
-    from app.pipeline import get_pipeline
 
     pipeline = get_pipeline()
-    if not pipeline.try_acquire():
-        print("error: pipeline is busy", file=sys.stderr)
+    lib, run = library_from_export(export), RunState(status="running")
+    pipeline.run(lib, run)
+    for stage, stats in run.stats.items():
+        print(f"{stage:>11}: {stats}")
+    if run.message:
+        print(f"note: {run.message}")
+    if run.status != "done":
         return 1
     with Session(get_engine()) as session:
-        run = IngestRun(stage="matching")
-        session.add(run)
-        session.commit()
-        session.refresh(run)
-        run_id = run.id
-    assert run_id is not None
-    pipeline.run(run_id)
-    with Session(get_engine()) as session:
-        done = session.get(IngestRun, run_id)
-        assert done is not None
-        for stage, stats in done.stats.items():
-            print(f"{stage:>11}: {stats}")
-        if done.message:
-            print(f"note: {done.message}")
-        return 0 if done.status == "done" else 1
-
-
-def cmd_build_index(_args: argparse.Namespace) -> int:
-    return run_pipeline()
+        out = pipeline.recommend(lib, session, limit=args.top)
+    if out is None:
+        print("no recommendations: no taste model could be built", file=sys.stderr)
+        return 1
+    for n, r in enumerate(out[0].items, start=1):
+        stars = f"~{r.predicted_rating:.1f}★" if r.predicted_rating is not None else f"{r.score:.2f}"
+        print(f"{n:>3}. {r.title} ({r.year or '?'})  {stars}")
+    return 0
 
 
 def cmd_train(args: argparse.Namespace) -> int:
@@ -97,13 +82,13 @@ def cmd_train(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(name)s: %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # request URLs carry titles and API keys
     parser = argparse.ArgumentParser(prog="app.cli")
     sub = parser.add_subparsers(dest="command", required=True)
-    p_ingest = sub.add_parser("ingest", help="parse a Letterboxd export ZIP into the local DB")
-    p_ingest.add_argument("zip")
-    p_ingest.set_defaults(func=cmd_ingest)
-    p_index = sub.add_parser("build-index", help="run matching/enrichment/embedding/taste")
-    p_index.set_defaults(func=cmd_build_index)
+    p_rec = sub.add_parser("recommend", help="process a Letterboxd export ZIP and print recommendations")
+    p_rec.add_argument("zip")
+    p_rec.add_argument("--top", type=int, default=20, help="how many films to print")
+    p_rec.set_defaults(func=cmd_recommend)
     p_train = sub.add_parser("train", help="download MovieLens and train the collaborative model")
     p_train.add_argument("--force", action="store_true", help="retrain even if the model is current")
     p_train.set_defaults(func=cmd_train)

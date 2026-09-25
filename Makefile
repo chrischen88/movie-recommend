@@ -2,7 +2,7 @@ PY      := backend/.venv/bin/python
 PIP     := backend/.venv/bin/pip
 EXPORT  ?= sample_letterboxd_export.zip
 
-.PHONY: setup setup-backend setup-frontend ingest sample build-index train serve serve-api serve-web test fly-deploy fly-push-data
+.PHONY: setup setup-backend setup-frontend recommend sample train serve serve-api serve-web test fly-deploy fly-push-data
 
 setup: setup-backend setup-frontend
 
@@ -19,12 +19,10 @@ setup-frontend:
 sample:
 	cd backend && .venv/bin/python -m tests.fixtures.sample_export ../$(EXPORT)
 
-# make ingest EXPORT=~/Downloads/letterboxd-you-2026-09-01-utc.zip
-ingest:
-	cd backend && .venv/bin/python -m app.cli ingest $(abspath $(EXPORT))
-
-build-index:
-	cd backend && .venv/bin/python -m app.cli build-index
+# make recommend EXPORT=~/Downloads/letterboxd-you-2026-09-01-utc.zip
+# Processes the export in memory (like a web session) and prints the top picks.
+recommend:
+	cd backend && .venv/bin/python -m app.cli recommend $(abspath $(EXPORT))
 
 # MovieLens collaborative model (score ③). FORCE=1 retrains even if current.
 train:

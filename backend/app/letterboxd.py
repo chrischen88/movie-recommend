@@ -153,7 +153,7 @@ def _locate_files(
 
 def _read_csv(raw: bytes, filename: str, warnings: list[str], required: str = "Name") -> pd.DataFrame:
     def warn(msg: str) -> None:
-        log.warning(msg)
+        log.debug(msg)
         warnings.append(msg)
 
     def bad_line(fields: list[str]) -> None:
@@ -194,7 +194,7 @@ class _Merger:
         self._reviews: dict[str, list[str]] = {}
 
     def warn(self, msg: str) -> None:
-        log.warning(msg)
+        log.debug(msg)
         self.warnings.append(msg)
 
     def film_for(self, row: pd.Series, filename: str, line: int) -> ParsedFilm | None:

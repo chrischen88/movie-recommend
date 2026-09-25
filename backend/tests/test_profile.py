@@ -5,8 +5,9 @@ import math
 import pytest
 from sqlmodel import Session
 
-from app.db import Movie, UserFilm, make_engine
-from app.profile import build_profile, film_features, load_profile, score_film, score_profile, user_ratings
+from app.db import Movie, make_engine
+from app.library import Library, LibraryFilm
+from app.profile import build_profile, film_features, load_profile, score_film, score_profile
 
 WEIGHTS = {"director": 1.0, "genre": 0.6, "actor": 0.5, "keyword": 0.4, "decade": 0.3, "language": 0.3, "country": 0.2}
 
@@ -141,19 +142,21 @@ def test_zero_weight_type_is_ignored() -> None:
     assert s.raw == 0.0 and s.contributions == []
 
 
-def test_user_ratings_and_load_profile() -> None:
+def test_library_ratings_and_load_profile() -> None:
+    lib = Library({
+        f.film_key: f for f in [
+            LibraryFilm("a|2000", "A", 2000, rating=4.0, tmdb_id=1),
+            LibraryFilm("a2|2000", "A2", 2000, rating=5.0, tmdb_id=1),  # same film
+            LibraryFilm("b|2000", "B", 2000, rating=2.0, tmdb_id=2),
+            LibraryFilm("c|2000", "C", 2000, rating=None, tmdb_id=3),  # unrated
+            LibraryFilm("d|2000", "D", 2000, rating=3.0, tmdb_id=None),  # unmatched
+        ]
+    })
+    assert lib.ratings() == {1: 4.5, 2: 2.0}
     engine = make_engine(":memory:")
     with Session(engine) as s:
-        s.add_all([
-            UserFilm(film_key="a|2000", name="A", rating=4.0, tmdb_id=1, content_hash="x"),
-            UserFilm(film_key="a2|2000", name="A2", rating=5.0, tmdb_id=1, content_hash="x"),  # same film
-            UserFilm(film_key="b|2000", name="B", rating=2.0, tmdb_id=2, content_hash="x"),
-            UserFilm(film_key="c|2000", name="C", rating=None, tmdb_id=3, content_hash="x"),  # unrated
-            UserFilm(film_key="d|2000", name="D", rating=3.0, tmdb_id=None, content_hash="x"),  # unmatched
-            mv(1, directors=["X"]), mv(2, directors=["Y"]), mv(3, directors=["X"]),
-        ])
+        s.add_all([mv(1, directors=["X"]), mv(2, directors=["Y"]), mv(3, directors=["X"])])
         s.commit()
-        assert user_ratings(s) == {1: 4.5, 2: 2.0}
-        p = load_profile(s, shrinkage_k=1.0)
+        p = load_profile(s, lib.ratings(), shrinkage_k=1.0)
         assert p is not None and p.n_rated == 2 and p.mean_rating == pytest.approx(3.25)
         assert p.stats[("director", "X")].n == 1

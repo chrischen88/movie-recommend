@@ -41,6 +41,10 @@ class VectorStore(Protocol):
 
     def delete(self, ids: Sequence[int]) -> None: ...
 
+    def strip_metadata_keys(self, keys: Sequence[str]) -> int:
+        """Remove `keys` from every record's metadata; returns how many records changed."""
+        ...
+
     def count(self) -> int: ...
 
 
@@ -128,6 +132,24 @@ class ChromaStore:
         if ids:
             self._col.delete(ids=[str(x) for x in ids])
 
+    def strip_metadata_keys(self, keys: Sequence[str]) -> int:
+        changed = 0
+        offset = 0
+        while True:
+            page = self._col.get(include=["metadatas"], limit=self.BATCH, offset=offset)  # type: ignore[list-item]
+            ids, metas = page["ids"], page.get("metadatas") or []
+            if not ids:
+                return changed
+            hit = [(i, m) for i, m in zip(ids, metas) if m and any(k in m for k in keys)]
+            if hit:
+                # A None value deletes the key; upsert would merge and keep it.
+                self._col.update(
+                    ids=[i for i, _ in hit],
+                    metadatas=[{k: None for k in keys if k in m} for _, m in hit],  # type: ignore[misc]
+                )
+                changed += len(hit)
+            offset += len(ids)
+
     def count(self) -> int:
         return int(self._col.count())
 
@@ -181,6 +203,14 @@ class InMemoryStore:
             self._emb.pop(int(i), None)
             self._meta.pop(int(i), None)
             self._docs.pop(int(i), None)
+
+    def strip_metadata_keys(self, keys: Sequence[str]) -> int:
+        changed = 0
+        for i, m in self._meta.items():
+            if any(k in m for k in keys):
+                self._meta[i] = {k: v for k, v in m.items() if k not in keys}
+                changed += 1
+        return changed
 
     def count(self) -> int:
         return len(self._emb)

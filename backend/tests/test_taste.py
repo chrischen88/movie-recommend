@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import pytest
 
@@ -130,21 +128,6 @@ def test_percentile_rank() -> None:
     np.testing.assert_allclose(percentile_rank(np.array([1.0, 1.0, 2.0])), [0.25, 0.25, 1.0])
     np.testing.assert_allclose(percentile_rank(np.array([7.0])), [1.0])
     assert len(percentile_rank(np.array([]))) == 0
-
-
-def test_model_save_load_roundtrip(tmp_path: Path) -> None:
-    ids, embs, ratings, genres = three_blobs()
-    model = build_taste_model(dict(zip(ids, ratings.tolist())), dict(zip(ids, embs)), genres, embedding_model="m")
-    assert model is not None
-    path = tmp_path / "taste.json"
-    model.save(path)
-    loaded = TasteModel.load(path)
-    assert loaded is not None
-    assert loaded.embedding_model == "m" and len(loaded.clusters) == len(model.clusters)
-    np.testing.assert_allclose(loaded.taste_vector, model.taste_vector, rtol=1e-6)
-    assert TasteModel.load(tmp_path / "missing.json") is None
-    (tmp_path / "bad.json").write_text("{not json")
-    assert TasteModel.load(tmp_path / "bad.json") is None
 
 
 def test_min_cluster_size_rejects_singleton_clusters() -> None:

@@ -62,6 +62,10 @@ export default function MatchReviewPage() {
             Fix films that didn't match TMDB, or matched with low confidence. Paste a TMDB id or a
             themoviedb.org URL.
           </p>
+          <p className="text-zinc-500 text-xs mt-1">
+            Fixes are saved in this browser and applied to your future uploads. To update your
+            recommendations now, run processing again on the Upload page.
+          </p>
         </div>
         <div className="flex gap-1 rounded-lg bg-zinc-900 p-1 text-sm">
           {(["review", "all"] as const).map((f) => (

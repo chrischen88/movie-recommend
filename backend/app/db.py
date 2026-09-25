@@ -1,4 +1,8 @@
-"""SQLite engine + table definitions (SQLModel)."""
+"""SQLite engine + table definitions (SQLModel).
+
+Only shared film data lives here: the API response cache and TMDB/OMDb metadata.
+Nothing about a user is stored (their library lives in memory: app/library.py).
+"""
 
 from __future__ import annotations
 
@@ -32,33 +36,8 @@ class ApiCache(SQLModel, table=True):
     expires_at: datetime | None = Field(default=None, index=True)
 
 
-class UserFilm(SQLModel, table=True):
-    """One film from the user's Letterboxd export (merged across CSVs)."""
-
-    film_key: str = Field(primary_key=True)  # normalized "title|year"
-    name: str
-    year: int | None = None
-    letterboxd_uri: str | None = None
-    rating: float | None = None
-    watched: bool = False
-    watched_date: str | None = None
-    diary_entries: int = 0
-    rewatch_count: int = 0
-    in_watchlist: bool = False
-    tags: list[str] = Field(default_factory=list, sa_column=Column(JSON))
-    review_text: str | None = None
-    content_hash: str
-    updated_at: datetime = Field(default_factory=utcnow)
-
-    # Filled in by TMDB matching (milestone 2)
-    tmdb_id: int | None = Field(default=None, index=True)
-    match_confidence: float | None = None
-    match_status: str | None = None  # matched | low_confidence | unmatched | manual | error | ignored
-    match_note: str | None = None  # human-readable reason, shown in match review
-
-
 class Movie(SQLModel, table=True):
-    """TMDB metadata for any film we know about (user films and candidates)."""
+    """TMDB metadata for every film looked up so far, shared by all users."""
 
     tmdb_id: int = Field(primary_key=True)
     title: str
@@ -86,35 +65,6 @@ class Movie(SQLModel, table=True):
     rt_score: int | None = None  # Rotten Tomatoes Tomatometer, 0–100
     metacritic: int | None = None  # Metascore, 0–100
     omdb_fetched_at: datetime | None = None
-
-
-class Candidate(SQLModel, table=True):
-    """A film proposed for recommendation, and where it came from."""
-
-    tmdb_id: int = Field(primary_key=True)
-    # e.g. ["recommendations:329865", "similar:603"]
-    sources: list[str] = Field(default_factory=list, sa_column=Column(JSON))
-    updated_at: datetime = Field(default_factory=utcnow)
-
-
-class AppState(SQLModel, table=True):
-    """Small key/value store for app-wide facts, e.g. whose export is loaded."""
-
-    key: str = Field(primary_key=True)
-    value: str
-    updated_at: datetime = Field(default_factory=utcnow)
-
-
-class IngestRun(SQLModel, table=True):
-    id: int | None = Field(default=None, primary_key=True)
-    started_at: datetime = Field(default_factory=utcnow)
-    finished_at: datetime | None = None
-    status: str = "running"  # running | done | error
-    stage: str = "parsing"
-    progress_done: int = 0
-    progress_total: int = 0
-    message: str | None = None
-    stats: dict = Field(default_factory=dict, sa_column=Column(JSON))
 
 
 _engine: Engine | None = None
@@ -156,6 +106,35 @@ def _add_missing_columns(engine: Engine) -> None:
                     default = f" DEFAULT {int(value) if isinstance(value, bool) else repr(value)}"
                 conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {col_type}{default}'))
                 log.info("migrated: added column %s.%s", table.name, col.name)
+
+
+# Tables and files from before user data moved into memory. They held one
+# person's library, so they're removed at startup (see purge_user_data).
+LEGACY_USER_TABLES = ("userfilm", "candidate", "appstate", "ingestrun")
+LEGACY_USER_FILES = ("taste_model.json", "blend_model.json")
+
+
+def purge_user_data(engine: Engine, data_dir: Path) -> list[str]:
+    """Drop the legacy per-user tables and model files; returns what was removed.
+
+    Idempotent. VACUUMs after dropping, because SQLite keeps a dropped table's
+    pages (and so its rows) in the file until then.
+    """
+    removed = [t for t in LEGACY_USER_TABLES if inspect(engine).has_table(t)]
+    if removed:
+        with engine.begin() as conn:
+            for table in removed:
+                conn.execute(text(f'DROP TABLE "{table}"'))
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(text("VACUUM"))
+    for name in LEGACY_USER_FILES:
+        path = data_dir / name
+        if path.exists():
+            path.unlink()
+            removed.append(name)
+    if removed:
+        log.warning("removed stored user data: %s", ", ".join(removed))
+    return removed
 
 
 def get_engine() -> Engine:

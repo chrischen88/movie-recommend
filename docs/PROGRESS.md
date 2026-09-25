@@ -15,28 +15,30 @@ _Last updated: 2026-09-24_
 | 4 | Score ① (taste profile) with explanations | ✅ Done |
 | 5 | MovieLens ingestion + score ③ | ✅ Done |
 | 6 | Candidate gen (discover), OMDb, learned blend, MMR, metrics page | ✅ Done |
+| — | Hosted multi-user service: in-memory sessions, shared film cache (requested outside the plan) | ✅ Done |
 | 7 | OpenAI layer: re-rank, explanations, natural-language requests | ⏭ Next |
 | 8 | UI polish, taste profile page, feedback loop, README | Not started |
 
-Tests: 209 passing (`make test`). The frontend type-checks and builds (`cd frontend && npm run build`).
+Tests: 216 passing (`make test`). The frontend type-checks and builds (`cd frontend && npm run build`).
 
 ## What exists (by module)
 
 - `backend/app/letterboxd.py`: parses the ZIP and merges the CSVs on a normalized `title|year` key.
 - `backend/app/cache.py`: SQLite response cache with TTL, rate limiter, retry/backoff client, and an optional daily budget (for OMDb).
-- `backend/app/ingest.py`: syncs an export into SQLite. Same account: incremental, using a content hash per film. Different account (from `profile.csv`'s Username): full replace (decision 15).
+- `backend/app/library.py`: a user's `Library` (films with their TMDB matches, candidates, taste model, blend), held in memory only. `library_from_export` applies the match fixes the browser sends with each upload.
+- `backend/app/sessions.py`: `SessionStore`, the in-memory sessions (random 256-bit id in the `X-Session-Id` header, dropped after `SESSION_TTL_SECONDS` idle, on delete, or on restart), the per-IP upload limit, and the single-worker run queue with its caps (decision 25).
 - `backend/app/tmdb.py`, `matching.py`: TMDB client and title/year matching with confidence scores.
-- `backend/app/pipeline.py`: background run: matching → enrichment → collab → candidates → embedding → taste → blend → omdb. The collab stage trains once, then is a no-op until the settings change; if MovieLens can't be fetched it's skipped with a message, and the run still succeeds. Candidates come from four sources: TMDB recommendations and similar lists for the top 60 films rated ≥ 4.0 (`CANDIDATE_SEED_COUNT`, was 25), `/discover/movie` for the profile's best genres and non-English languages, and ③'s top predictions. The blend stage refits only when its inputs' fingerprint changes. The OMDb stage fetches the top-150 shortlist once per `CACHE_TTL_OMDB`; a bad key or an exhausted budget skips it without failing the run.
+- `backend/app/pipeline.py`: one run per session over its `Library`: matching → enrichment → collab → candidates → embedding → taste → blend → omdb. Film data it learns is shared (`Movie`, `ApiCache`, the Chroma index), so a second user with the same films makes no API calls. A deleted or expired session stops its run at the next check. At startup `purge_user_data` drops what older versions stored (user tables, model files, the index's `seen` flags). The collab stage trains once, then is a no-op until the settings change; if MovieLens can't be fetched it's skipped with a message, and the run still succeeds. Candidates come from four sources: TMDB recommendations and similar lists for the top 60 films rated ≥ 4.0 (`CANDIDATE_SEED_COUNT`, was 25), `/discover/movie` for the profile's best genres and non-English languages, and ③'s top predictions. The taste model and blend are fitted fresh for each run, in memory. The OMDb stage fetches the top-150 shortlist once per `CACHE_TTL_OMDB`; a bad key or an exhausted budget skips it without failing the run.
 - `backend/app/embeddings.py`, `vectorstore.py`, `taste.py`: film documents, the `VectorStore` interface (Chroma + in-memory), the taste vector, clusters, and score ②.
-- `backend/app/profile.py`: score ①. Builds the taste profile (shrunk mean rating deviation per director/genre/actor/keyword/decade/language/country), scores candidates, and keeps the top contributions as explanations. Also `user_ratings()`, which the taste-vector build shares.
+- `backend/app/profile.py`: score ①. Builds the taste profile (shrunk mean rating deviation per director/genre/actor/keyword/decade/language/country), scores candidates, and keeps the top contributions as explanations. `load_profile` takes the ratings from `Library.ratings()`.
 - `backend/app/movielens.py`: downloads the MovieLens ZIP (streamed, atomic) and loads ratings plus the movieId → tmdbId links.
 - `backend/app/blend.py`: cross-fitted out-of-fold ①②③ for your rated films, a non-negative Ridge blend (with and without ③), fixed-weight fallback, and the metrics (decision 17).
 - `backend/app/omdb.py`: OMDb client (IMDb rating, Rotten Tomatoes, Metascore) over `CachedHttpClient` with the daily budget.
 - `backend/app/collab.py`: score ③. Explicit ALS with biases (numpy/scipy), a saved base model, the user folded in per request, and predicted stars per candidate.
 - `backend/app/recommend.py`: scores every eligible film, ranks by the blend's predicted rating (or the fixed-weight score), adds the watchlist boost, applies `RecFilters` (min rating from TMDB/IMDb/RT/Metacritic, quality floor, genre, decade, max runtime, language), hides shorts, then re-ranks with MMR.
-- `backend/app/main.py`: FastAPI. Routes: `/api/health`, `/api/upload`, `/api/ingest/{id|latest|resume}`, `/api/films`, `/api/matches[/set|/accept|/ignore]`, `/api/recommendations`, `/api/taste`, `/api/metrics`. When `frontend/dist` exists it also serves the built UI (any non-`/api` path falls back to `index.html`). Setting `AUTH_PASSWORD` puts everything except `/api/health` behind HTTP Basic auth. At startup, runs a previous process left `running` are marked failed (`Pipeline.fail_interrupted_runs`).
+- `backend/app/main.py`: FastAPI. Routes: `/api/health`, `POST /api/sessions` (upload + saved fixes), `GET|DELETE /api/session`, `POST /api/session/reprocess`, `/api/matches[/set|/accept|/ignore]`, `/api/recommendations`, `/api/taste`, `/api/metrics`. Everything but health and upload needs `X-Session-Id`; a missing or expired session is 410. When `frontend/dist` exists it also serves the built UI (any non-`/api` path falls back to `index.html`). Setting `AUTH_PASSWORD` puts everything except `/api/health` behind HTTP Basic auth. `httpx` request logging is off: its URLs carry film titles and API keys.
 - Deployment (Fly.io): `Dockerfile`, `fly.toml`, `deploy/start.sh`, `scripts/fly-push-data.sh` (`make fly-deploy`, `make fly-push-data`). See [DEPLOY.md](DEPLOY.md).
-- `frontend/`: Upload (progress stepper), Matches (review/fix), Recommendations (poster grid, filter bar, cluster chips, predicted "~4.5★ for you", TMDB/IMDb/RT/Metacritic ratings, ①②③ bars, up to 3 "why" lines per card) and Metrics (blend weights, held-out accuracy per method, candidate sources, MovieLens and OMDb usage) pages.
+- `frontend/`: `api.ts` keeps the session id and the match fixes in localStorage. Upload (progress stepper, queue position, "Forget my data now", privacy note), Matches (review/fix), Recommendations (poster grid, filter bar, cluster chips, predicted "~4.5★ for you", TMDB/IMDb/RT/Metacritic ratings, ①②③ bars, up to 3 "why" lines per card) and Metrics (blend weights, held-out accuracy per method, candidate sources, MovieLens and OMDb usage) pages.
 
 ## Decisions & deviations from the spec
 
@@ -68,6 +70,14 @@ These are deliberate, so don't "fix" them back without reason.
 
 23. **The ranking mixes taste fit back in** (`RANK_FIT_WEIGHT=0.5`). In learned mode, films are ranked by the percentile of ½·pct(predicted rating) + ½·pct(taste fit), where taste fit is the mean of ① and ②. The "~4.4★ for you" on each card is still the learned prediction. Why: the learned blend puts ③ at 2.7★ and ① and ② at 0 (see the open item below), so 38 of the top 60 were below the median on ① or ② (acclaimed canon, not the user's kind of film). With the mix, that's 1 of 60, and the median predicted rating of the top 60 only drops from 4.44★ to 4.29★. Cost on held-out ratings: Spearman 0.52 for the ranking vs 0.62 for the prediction alone. That's expected, because the holdout measures *how you rate films you chose to watch*, while ② mostly captures *what you choose*. The metrics page shows both rows. Fixed mode (< 50 ratings) is unchanged, since ①② already carry 70% of the weight there.
 24. **Hosted on one Fly Machine that suspends when idle** ([DEPLOY.md](DEPLOY.md)). Serverless hosts (Vercel, Firebase/Cloud Run) don't fit: the app needs a persistent disk for SQLite and Chroma, about 2 GB of RAM for PyTorch, and background threads that outlive the request. The API serves the built UI itself, so there is one origin, one login and one deploy. 2 GB is also Fly's largest suspendable size, and suspend makes a resume take a few hundred ms instead of a PyTorch cold start. Data is built locally and uploaded (`make fly-push-data`), because the shared CPU is slow at embedding and 2 GB can't train `ml-32m`.
+
+25. **User data lives in memory only; film data is shared** (supersedes 15). The app is a public service, so nothing about a user is written to disk: an upload becomes an in-memory session that's dropped after an hour idle (`SESSION_TTL_SECONDS`), on "Forget my data now", or on restart. What is persisted and shared is film data: the API cache, `Movie` rows (TMDB metadata and OMDb ratings), the Chroma index (film documents only, no per-user flags) and the MovieLens model. Consequences:
+    - Every upload is processed from scratch, but only the per-user maths (profile, taste, blend) is repeated: films other users already brought in cost no API calls or embedding. Measured on the sample export: 691 new API responses and 59 s the first time, 0 and 1 s for a second session.
+    - Match fixes are kept in the browser's localStorage and sent with each upload, so they survive a session without the server storing them.
+    - Runs go through one worker thread, one at a time; queue and session counts are capped (`MAX_QUEUED_RUNS`, `MAX_SESSIONS`), and uploads are limited per IP (`UPLOADS_PER_IP_PER_HOUR`), because the app has no login.
+    - The only user-derived strings left on disk are TMDB search queries (film titles) in `ApiCache`, which aren't linked to any person or session.
+    - The session id is a bearer secret, so it goes in a header, not the URL (URLs end up in access logs).
+    - Future features must follow this too: e.g. M7's per-review LLM outputs can only be cached in the session, not on disk.
 
 ## Open items / known issues
 
@@ -112,4 +122,4 @@ _Done: everything below except the review-query idea, which is still open (keep 
 
 - **Dev servers:** the user runs `make serve` on :8000 (API) and :5173 (Vite). For verification, run separate instances instead: API on :8765 with `DATA_DIR` pointing at a scratch dir, and `API_PORT=8765 npm run dev -- --port 5199 --strictPort`. Never kill processes on :8000 or :5173.
 - **Tests use fakes, never the network:** `tests/fake_tmdb.py` (an httpx MockTransport TMDB), `tests/fake_embedder.py` (a hashing embedder) and `InMemoryStore`. `tests/test_pipeline.py::make_pipeline` wires them together.
-- **Sample data:** `make sample` writes a synthetic 30-film export (real titles, made-up user). `backend/data/` holds the user's real data and is gitignored.
+- **Sample data:** `make sample` writes a synthetic 30-film export (real titles, made-up user). `backend/data/` holds the shared film data (API cache, metadata, index, MovieLens) and is gitignored. `make recommend EXPORT=…` runs an export through the pipeline in the terminal.

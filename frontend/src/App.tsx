@@ -60,6 +60,27 @@ export default function App() {
           <Route path="/metrics" element={<MetricsPage />} />
         </Routes>
       </main>
+      <footer className="border-t border-zinc-800">
+        <div className="mx-auto max-w-6xl px-4 py-4 text-xs text-zinc-500 space-y-1">
+          <p>
+            Film data and posters from{" "}
+            <a href="https://www.themoviedb.org/" className="underline hover:text-zinc-300">
+              TMDB
+            </a>
+            . This product uses the TMDB API but is not endorsed or certified by TMDB. IMDb, Rotten
+            Tomatoes and Metacritic ratings via{" "}
+            <a href="https://www.omdbapi.com/" className="underline hover:text-zinc-300">
+              OMDb
+            </a>
+            ; collaborative scores trained on{" "}
+            <a href="https://grouplens.org/datasets/movielens/" className="underline hover:text-zinc-300">
+              MovieLens
+            </a>
+            . Not affiliated with Letterboxd.
+          </p>
+          <p>Your export is processed in memory and never saved on the server.</p>
+        </div>
+      </footer>
     </div>
   );
 }

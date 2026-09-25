@@ -1,6 +1,6 @@
 # Deploying to Fly.io
 
-The whole app runs as one Fly Machine. FastAPI serves both the API and the built UI on one port. The data (SQLite, the Chroma index and the trained models) lives on a volume mounted at `/data`.
+The whole app runs as one Fly Machine. FastAPI serves both the API and the built UI on one port. Shared film data (SQLite with the API cache and film metadata, the Chroma index, the MovieLens model) lives on a volume mounted at `/data`. User data never touches it: each upload lives in server memory for one visit.
 
 | File | Role |
 |---|---|
@@ -17,12 +17,12 @@ The whole app runs as one Fly Machine. FastAPI serves both the API and the built
    fly apps create <your-app-name>
    fly volumes create data --region iad --size 3 -y
    ```
-3. Set the secrets. `AUTH_PASSWORD` turns on the login (user `letterboxd`, or set `AUTH_USERNAME`). **Without it, anyone with the URL can use your API keys.**
+3. Set the secrets. To keep the app private, also set `AUTH_PASSWORD` (a shared login, user `letterboxd` or `AUTH_USERNAME`). Without it the app is public: see [Public mode](#public-mode).
    ```bash
-   fly secrets set TMDB_API_KEY=... OMDB_API_KEY=... AUTH_PASSWORD=...
+   fly secrets set TMDB_API_KEY=... OMDB_API_KEY=...   # plus AUTH_PASSWORD=... for a private app
    ```
 4. Deploy: `make fly-deploy`. The first build takes a few minutes, mostly PyTorch.
-5. Copy your data up: `make fly-push-data`. This skips re-running matching, embedding and training on the server. Alternatively, upload your export in the UI and let the server process it, which is slow on a shared CPU.
+5. Copy your film data up: `make fly-push-data`. It uploads the API cache, film metadata, the index and the MovieLens model, so the server starts with everything your local runs already fetched and embedded. User tables are stripped from the snapshot before it leaves your machine.
 6. Open `https://<your-app-name>.fly.dev` and log in.
 
 `MOVIELENS_DATASET` in `fly.toml` must match the model you upload. Training `ml-32m` needs more than 2 GB of RAM, so train it locally (`make train`) and push the model.
@@ -30,17 +30,29 @@ The whole app runs as one Fly Machine. FastAPI serves both the API and the built
 ## Day to day
 
 - **Code changes:** `make fly-deploy`. A deploy discards the suspend snapshot, so the next visit is a full cold start (seconds, not milliseconds).
-- **A newer Letterboxd export:** upload it in the UI. Runs are incremental, so only new or changed films are processed.
-- **Replacing the server's data with your local data:** `make fly-push-data`. This **overwrites** everything on the server, including match fixes you made there.
+- **A newer Letterboxd export:** upload it in the UI. Films already in the shared cache cost no API calls.
+- **Replacing the server's film data with your local copy:** `make fly-push-data`. This **overwrites** the server's cache and index, including films other users brought in. There's no user data to lose.
 - **Logs and a shell:** `fly logs`, `fly ssh console`.
 
 ## How it behaves
 
 - **Suspend when idle.** With no traffic, Fly suspends the machine (a RAM snapshot). The next request resumes it in a few hundred ms, and a pipeline run in progress carries on. You pay for storage only while it's suspended.
-- **Interrupted runs.** A deploy, crash or out-of-memory kill ends any pipeline run. At startup the app marks such runs as failed, and the Upload page offers "Run processing again".
-- **One machine only.** SQLite, the volume and the pipeline's in-memory run lock all assume a single process. Don't `fly scale count` above 1.
+- **Sessions end on restart.** A deploy, crash or out-of-memory kill drops every session (they're only in memory). Users see "Your session ended" and upload again; thanks to the shared cache that's quick.
+- **One machine only.** SQLite, the volume, the in-memory sessions and the one-at-a-time run queue all assume a single process. Don't `fly scale count` above 1.
 - **`/api/health` is open** without a login, for Fly's health checks and so the push script can wake the machine. It reveals only which API keys are configured.
 - **Backups.** Fly snapshots volumes daily. List them with `fly volumes snapshots list <volume-id>`.
+
+## Public mode
+
+Without `AUTH_PASSWORD`, anyone with the URL can use the app. What protects it:
+
+- **Uploads per IP:** 10 an hour (`UPLOADS_PER_IP_PER_HOUR`), keyed on Fly's `Fly-Client-IP` header. Over the limit is HTTP 429.
+- **Capacity:** at most 20 live sessions (`MAX_SESSIONS`) and 5 runs waiting or processing (`MAX_QUEUED_RUNS`); runs go one at a time. Over either limit is HTTP 503 "try again shortly".
+- **Export size:** 50 MB and 5,000 films (`MAX_EXPORT_FILMS`).
+- **OMDb quota:** the 1,000-a-day budget is enforced; when it runs out, ratings are skipped until the next day and runs still finish.
+- **Cost:** one fixed-size machine, so abuse can slow the app down but not raise the bill.
+
+Privacy: an export is processed in memory and dropped after an hour idle (`SESSION_TTL_SECONDS`), on "Forget my data now", or on restart. Logs carry no film titles or API keys (`httpx` request logging is off). The only user-derived strings on disk are TMDB search queries (film titles) in the API cache, not linked to anyone. The footer credits TMDB (required by its terms), OMDb and MovieLens. MovieLens and OMDb's free tier are non-commercial, so the app must stay free.
 
 ## Cost
 

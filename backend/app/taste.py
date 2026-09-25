@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -47,56 +45,6 @@ class TasteModel:
             if c.source == source:
                 return c.label
         return "Your overall taste"
-
-    # -- persistence (small: a handful of 384-d vectors) --
-
-    def to_json(self) -> dict:
-        return {
-            "mean_rating": self.mean_rating,
-            "n_rated": self.n_rated,
-            "taste_vector": self.taste_vector.tolist(),
-            "silhouette": self.silhouette,
-            "embedding_model": self.embedding_model,
-            "clusters": [
-                {"id": c.id, "centroid": c.centroid.tolist(), "member_ids": c.member_ids, "label": c.label}
-                for c in self.clusters
-            ],
-        }
-
-    @classmethod
-    def from_json(cls, data: dict) -> TasteModel:
-        return cls(
-            mean_rating=data["mean_rating"],
-            n_rated=data["n_rated"],
-            taste_vector=np.asarray(data["taste_vector"], dtype=np.float32),
-            silhouette=data.get("silhouette"),
-            embedding_model=data.get("embedding_model", ""),
-            clusters=[
-                TasteCluster(
-                    id=c["id"],
-                    centroid=np.asarray(c["centroid"], dtype=np.float32),
-                    member_ids=list(c["member_ids"]),
-                    label=c["label"],
-                )
-                for c in data.get("clusters", [])
-            ],
-        )
-
-    def save(self, path: Path) -> None:
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.to_json()))
-        tmp.replace(path)
-
-    @classmethod
-    def load(cls, path: Path) -> TasteModel | None:
-        if not path.exists():
-            return None
-        try:
-            return cls.from_json(json.loads(path.read_text()))
-        except (ValueError, KeyError) as exc:
-            log.error("could not read taste model %s: %s", path, exc)
-            return None
-
 
 # ---------------------------------------------------------------- building
 

@@ -4,41 +4,41 @@ export interface Health {
 }
 
 export interface UploadResult {
-  run_id: number;
+  session_id: string;
+  expires_in: number;
   files_found: string[];
   stats: Record<string, number>;
   warnings: string[];
 }
 
-export interface IngestRun {
+export interface Run {
   id: number;
   started_at: string;
   finished_at: string | null;
-  status: "running" | "done" | "error";
+  status: "queued" | "running" | "done" | "error" | "cancelled";
   stage: string;
   progress_done: number;
   progress_total: number;
   message: string | null;
   stats: {
-    added?: number;
-    changed?: number;
-    unchanged?: number;
-    removed?: number;
-    /** True when the export was from a different account and replaced all data. */
-    reset?: boolean;
-    account?: string | null;
     films?: number;
     rated?: number;
     watchlist?: number;
     warnings?: number;
+    /** Match fixes saved in this browser that applied to this export. */
+    fixes_applied?: number;
     matching?: Record<string, number>;
     enrichment?: Record<string, number>;
   };
 }
 
 export interface RunOut {
-  run: IngestRun;
+  run: Run;
   stages: string[];
+  /** 0 while processing, n while n exports are ahead in line, null when idle. */
+  queue_position: number | null;
+  /** Seconds until the session is deleted if unused. */
+  expires_in: number;
 }
 
 export interface MovieBrief {
@@ -191,8 +191,75 @@ export interface TasteResponse {
   clusters: TasteCluster[];
 }
 
+// ---------------------------------------------------------------- session & saved fixes
+
+// Your data lives in server memory for one visit; this id is its key. The match
+// fixes you make are kept here in the browser and sent with every upload.
+const SESSION_KEY = "sessionId";
+const FIXES_KEY = "matchFixes";
+
+export type MatchFix = { tmdb_id: number } | { ignored: true };
+
+function storageGet(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function storageSet(key: string, value: string | null): void {
+  try {
+    if (value === null) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, value);
+  } catch {
+    /* storage unavailable (private mode): the session lasts for this page only */
+  }
+}
+
+let memorySession: string | null = null;
+const sessionId = () => storageGet(SESSION_KEY) ?? memorySession;
+function setSessionId(id: string | null) {
+  memorySession = id;
+  storageSet(SESSION_KEY, id);
+}
+
+export const hasSession = () => sessionId() !== null;
+
+/** Why there's nothing to show: never uploaded, or the session is gone. */
+let sessionEnded = false;
+export const noSessionMessage = () =>
+  sessionEnded
+    ? "Your session ended (it's deleted after an hour without use). Upload your export again."
+    : "Upload your Letterboxd export to get started.";
+
+export function savedFixes(): Record<string, MatchFix> {
+  try {
+    const parsed = JSON.parse(storageGet(FIXES_KEY) ?? "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveFix(filmKey: string, fix: MatchFix) {
+  storageSet(FIXES_KEY, JSON.stringify({ ...savedFixes(), [filmKey]: fix }));
+}
+
+export const clearSavedFixes = () => storageSet(FIXES_KEY, null);
+
+class SessionGone extends Error {}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const resp = await fetch(path, init);
+  const headers = new Headers(init?.headers);
+  const id = sessionId();
+  if (id) headers.set("X-Session-Id", id);
+  const resp = await fetch(path, { ...init, headers });
+  if (resp.status === 410) {
+    setSessionId(null);
+    sessionEnded = true;
+    throw new SessionGone("session ended");
+  }
   if (!resp.ok) {
     let detail = resp.statusText;
     try {
@@ -205,6 +272,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return resp.json() as Promise<T>;
 }
 
+/** Calls that need a session answer `fallback` when there isn't one. */
+async function withSession<T>(call: () => Promise<T>, fallback: () => T): Promise<T> {
+  if (!hasSession()) return fallback();
+  try {
+    return await call();
+  } catch (e) {
+    if (e instanceof SessionGone) return fallback();
+    throw e;
+  }
+}
+
 const postJson = <T>(path: string, body: unknown) =>
   request<T>(path, {
     method: "POST",
@@ -212,30 +290,69 @@ const postJson = <T>(path: string, body: unknown) =>
     body: JSON.stringify(body),
   });
 
+const saving = (row: Promise<MatchRow>, fix: (r: MatchRow) => MatchFix | null) =>
+  row.then((r) => {
+    const f = fix(r);
+    if (f) saveFix(r.film_key, f);
+    return r;
+  });
+
 export const api = {
   health: () => request<Health>("/api/health"),
-  upload: (file: File) => {
+  upload: async (file: File) => {
     const body = new FormData();
     body.append("file", file);
-    return request<UploadResult>("/api/upload", { method: "POST", body });
+    body.append("fixes", JSON.stringify(savedFixes()));
+    const result = await request<UploadResult>("/api/sessions", { method: "POST", body });
+    setSessionId(result.session_id);
+    sessionEnded = false;
+    return result;
   },
-  run: (id: number) => request<RunOut>(`/api/ingest/${id}`),
-  latestRun: () => request<RunOut | null>("/api/ingest/latest"),
-  resume: () => request<{ run_id: number }>("/api/ingest/resume", { method: "POST" }),
-  matches: (filter: "review" | "all") => request<MatchesResponse>(`/api/matches?filter=${filter}`),
+  session: () => withSession<RunOut | null>(() => request<RunOut>("/api/session"), () => null),
+  reprocess: () => request<RunOut>("/api/session/reprocess", { method: "POST" }),
+  forget: async () => {
+    try {
+      await request<{ deleted: boolean }>("/api/session", { method: "DELETE" });
+    } finally {
+      setSessionId(null);
+      sessionEnded = false;
+    }
+  },
+  matches: (filter: "review" | "all") =>
+    withSession<MatchesResponse>(
+      () => request<MatchesResponse>(`/api/matches?filter=${filter}`),
+      () => ({ counts: {}, rows: [] }),
+    ),
   setMatch: (film_key: string, tmdb_ref: string) =>
-    postJson<MatchRow>("/api/matches/set", { film_key, tmdb_ref }),
-  acceptMatch: (film_key: string) => postJson<MatchRow>("/api/matches/accept", { film_key }),
-  ignoreMatch: (film_key: string) => postJson<MatchRow>("/api/matches/ignore", { film_key }),
+    saving(postJson<MatchRow>("/api/matches/set", { film_key, tmdb_ref }), (r) =>
+      r.tmdb_id ? { tmdb_id: r.tmdb_id } : null,
+    ),
+  acceptMatch: (film_key: string) =>
+    saving(postJson<MatchRow>("/api/matches/accept", { film_key }), (r) =>
+      r.tmdb_id ? { tmdb_id: r.tmdb_id } : null,
+    ),
+  ignoreMatch: (film_key: string) =>
+    saving(postJson<MatchRow>("/api/matches/ignore", { film_key }), () => ({ ignored: true })),
   recommendations: (limit = 60, filters: RecFilters = {}) => {
     const qs = new URLSearchParams({ limit: String(limit) });
     for (const [k, v] of Object.entries(filters)) {
       if (v !== undefined && v !== "") qs.set(k, String(v));
     }
-    return request<RecommendationsResponse>(`/api/recommendations?${qs}`);
+    return withSession<RecommendationsResponse>(
+      () => request<RecommendationsResponse>(`/api/recommendations?${qs}`),
+      () => ({ ready: false, message: noSessionMessage(), items: [] }),
+    );
   },
-  taste: () => request<TasteResponse>("/api/taste"),
-  metrics: () => request<MetricsResponse>("/api/metrics"),
+  taste: () =>
+    withSession<TasteResponse>(
+      () => request<TasteResponse>("/api/taste"),
+      () => ({ ready: false, message: noSessionMessage(), clusters: [] }),
+    ),
+  metrics: () =>
+    withSession<MetricsResponse>(
+      () => request<MetricsResponse>("/api/metrics"),
+      () => ({ ready: false, message: noSessionMessage() }),
+    ),
 };
 
 export const posterUrl = (path: string | null, size: "w92" | "w185" | "w342" = "w92") =>

@@ -1,8 +1,8 @@
 # Letterboxd Recommender
 
-A local app that recommends films from your Letterboxd export. It blends three scores into one ranked list: a content-based taste profile, embedding similarity from a vector DB, and collaborative filtering.
+A web app that recommends films from your Letterboxd export, run locally or hosted for several people. It blends three scores into one ranked list: a content-based taste profile, embedding similarity from a vector DB, and collaborative filtering.
 
-> **Status:** milestones 1–3 of 8 are done: scaffold, caching, and export parsing (1); TMDB matching, enrichment, and the match-review UI (2); embeddings, the Chroma index, taste vector and clusters, score ②, and a recommendations page (3).
+> **Status:** milestones 1–6 of 8 are done, plus hosting as a multi-user service. See [docs/PROGRESS.md](docs/PROGRESS.md).
 
 ## Setup
 
@@ -17,37 +17,37 @@ make test             # run the backend test suite
 ## Usage
 
 ```bash
+make serve                                    # API on :8000, UI on :5173: upload your export there
 make sample                                   # writes a synthetic 30-film export ZIP
-make ingest EXPORT=sample_letterboxd_export.zip
-make ingest EXPORT=~/Downloads/letterboxd-you-2026-09-01-utc.zip
-make build-index                              # re-run the pipeline (incremental)
-make serve                                    # API on :8000, UI on :5173
+make recommend EXPORT=sample_letterboxd_export.zip   # or run an export in the terminal
+make train                                    # MovieLens model for score ③ (FORCE=1 to retrain)
 ```
 
-Re-ingesting a newer export is incremental. Each film is stored with a content hash, so only added or changed films are reprocessed, and films removed from the export are deleted.
+**Nothing about you is stored.** An upload is processed in server memory and deleted after an hour without use, when you click "Forget my data now", or when the server restarts. What's kept, and shared by everyone, is film data: cached TMDB/OMDb responses, film metadata, film embeddings and the MovieLens model. So each export makes the next one cheaper: films someone else already brought in cost no API calls. Match fixes you make are saved in your browser and re-applied to your next upload.
 
 ## Hosting
 
-The app deploys to Fly.io as a single machine that suspends when idle (about $2–4 a month for personal use). See [docs/DEPLOY.md](docs/DEPLOY.md). Set `AUTH_PASSWORD` on any public deployment.
+The app deploys to Fly.io as a single machine that suspends when idle (about $2–4 a month for a handful of users a week). It can run public, with per-IP upload limits and a capped queue, or behind a shared password (`AUTH_PASSWORD`). See [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## Layout
 
 ```
 backend/app/
   config.py      tunable weights and params (overridable via env)
-  db.py          SQLModel tables (ApiCache, UserFilm, Movie, IngestRun) + auto-migration
+  db.py          SQLModel tables (ApiCache, Movie: shared film data only) + auto-migration
   cache.py       SQLite response cache (TTL), rate limiter, retrying HTTP client
   letterboxd.py  export ZIP parser, which merges ratings/watched/diary/watchlist/reviews
-  ingest.py      incremental sync into SQLite
+  library.py     a user's films, candidates and models, in memory only
+  sessions.py    in-memory sessions, upload limits and the run queue
   tmdb.py        TMDB client (v3 key or v4 bearer token) + metadata parsing
   matching.py    title/year → TMDB id matching with confidence scores
-  pipeline.py    background run: matching → enrichment → candidates → embedding → taste
+  pipeline.py    per-session run: matching → enrichment → collab → candidates → embedding → taste → blend → omdb
   embeddings.py  film documents + sentence-transformers embedder
   vectorstore.py VectorStore interface: ChromaStore (default) + InMemoryStore
   taste.py       taste vector, k-means taste clusters, score ②
   recommend.py   assembles the ranked recommendation list
   main.py        FastAPI app
-  cli.py         `python -m app.cli ingest <zip>`
+  cli.py         `python -m app.cli recommend <zip>`, `train`
 backend/tests/   pytest suite + synthetic export fixture
 frontend/        React + Vite + TypeScript + Tailwind
 ```

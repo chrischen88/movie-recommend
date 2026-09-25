@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Copy the local app data (backend/data) to the Fly app, replacing what's there.
+# Copy the local film data (backend/data) to the Fly app, replacing what's there.
 #
-# Uploads a snapshot of the database, the Chroma index and the trained models, so
-# the server doesn't redo matching, embedding and training on its slow shared CPU.
-# The raw MovieLens download is skipped: only the trained model is needed.
+# Uploads a snapshot of the shared film data: the API cache and TMDB/OMDb
+# metadata (SQLite), the Chroma index and the MovieLens model. That saves the
+# server the API calls, embedding and training on its slow shared CPU. The raw
+# MovieLens download is skipped: only the trained model is needed. User data
+# isn't part of it: a database from an older version still has user tables, and
+# the server drops them (and VACUUMs) at startup.
 # Don't run this while a local pipeline run is in progress.
 #
 # Usage: scripts/fly-push-data.sh [app-name]   (default: `app` in fly.toml)
@@ -42,9 +45,26 @@ for rel in ("app.sqlite3", "chroma/chroma.sqlite3"):
             a.backup(b)
 PYEOF
 rm -f "$STAGE"/data/chroma/chroma.sqlite3-{wal,shm}
-for f in taste_model.json blend_model.json; do
-  [ -f "$DATA/$f" ] && cp "$DATA/$f" "$STAGE/data/"
-done
+
+# Strip user data from the snapshot before it leaves this machine: the same
+# purge the server runs at startup (legacy user tables + VACUUM, index flags).
+(cd "$ROOT/backend" && "$PY" - "$STAGE/data" <<'PYEOF'
+import sys
+from pathlib import Path
+from sqlalchemy import text
+from app.db import make_engine, purge_user_data
+from app.vectorstore import ChromaStore
+data = Path(sys.argv[1])
+engine = make_engine(data / "app.sqlite3")
+removed = purge_user_data(engine, data)
+with engine.connect() as conn:
+    conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
+engine.dispose()
+flags = ChromaStore(data / "chroma").strip_metadata_keys(["seen"])
+print(f"stripped from snapshot: {', '.join(removed) or 'no user tables'}; index flags on {flags} films")
+PYEOF
+)
+rm -f "$STAGE"/data/app.sqlite3-{wal,shm}
 cp "$DATA"/movielens/model-*.npz "$STAGE/data/movielens/" 2>/dev/null || true
 
 tar -czf "$STAGE/import.tgz" -C "$STAGE/data" .

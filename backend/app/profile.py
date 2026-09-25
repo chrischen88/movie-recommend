@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from sqlmodel import Session, col, select
 
-from app.db import Movie, UserFilm
+from app.db import Movie
 from app.taste import percentile_rank
 
 FEATURE_TYPES = ("director", "genre", "actor", "keyword", "decade", "language", "country")
@@ -160,21 +160,7 @@ def score_profile(
 # ---------------------------------------------------------------- loading
 
 
-def user_ratings(session: Session) -> dict[int, float]:
-    """tmdb_id → rating. Two Letterboxd entries can map to one TMDB film: average them."""
-    per_film: dict[int, list[float]] = {}
-    rows = session.exec(
-        select(UserFilm.tmdb_id, UserFilm.rating).where(
-            col(UserFilm.tmdb_id).is_not(None), col(UserFilm.rating).is_not(None)
-        )
-    )
-    for tid, rating in rows:
-        if tid is not None and rating is not None:
-            per_film.setdefault(tid, []).append(rating)
-    return {tid: sum(rs) / len(rs) for tid, rs in per_film.items()}
-
-
-def load_profile(session: Session, shrinkage_k: float) -> TasteProfile | None:
-    ratings = user_ratings(session)
+def load_profile(session: Session, ratings: Mapping[int, float], shrinkage_k: float) -> TasteProfile | None:
+    """The profile for `ratings` (tmdb_id → stars, see `Library.ratings`)."""
     movies = {m.tmdb_id: m for m in session.exec(select(Movie).where(col(Movie.tmdb_id).in_(ratings)))}
     return build_profile(ratings, movies, shrinkage_k)

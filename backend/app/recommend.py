@@ -17,8 +17,9 @@ import numpy as np
 
 from app.blend import BlendModel, rank_with_fit, taste_fit
 from app.collab import CollabScorer
-from app.db import Candidate, Movie, UserFilm
-from app.profile import Contribution, TasteProfile, score_profile, user_ratings
+from app.db import Movie
+from app.library import Library
+from app.profile import Contribution, TasteProfile, score_profile
 from app.taste import TasteModel, percentile_rank, score_embeddings
 from app.vectorstore import VectorStore
 
@@ -140,32 +141,10 @@ def facets_for(recs: list[Recommendation]) -> Facets:
     )
 
 
-def _seen_ids(session: Session) -> set[int]:
-    return {
-        i
-        for i in session.exec(
-            select(UserFilm.tmdb_id).where(col(UserFilm.watched).is_(True))
-        )
-        if i is not None
-    }
-
-
-def eligible_ids(session: Session) -> set[int]:
-    """Films that can be recommended: current candidates and the user's unwatched
-    (watchlist) films."""
-    return current_film_ids(session) - _seen_ids(session)
-
-
-def current_film_ids(session: Session) -> set[int]:
-    """The user's own matched films plus the current candidates. Anything else in
-    the index or `movie` table is left over from an earlier library."""
-    own = {i for i in session.exec(select(UserFilm.tmdb_id)) if i is not None}
-    return own | set(session.exec(select(Candidate.tmdb_id)).all())
-
-
 def recommend(
     session: Session,
     store: VectorStore,
+    lib: Library,
     model: TasteModel,
     *,
     limit: int = 40,
@@ -191,8 +170,8 @@ def recommend(
     # Every unseen film in the library or candidate set is scored: a few hundred
     # to a few thousand dot products, so no nearest-neighbour cutoff. (A k-NN
     # prefilter would drop films that ① or ③ rate highly just because ② doesn't.)
-    # The DB, not the index, is the truth for what's seen and still in the library.
-    pool = eligible_ids(session)
+    # The index is shared by every user, so the pool comes from the library.
+    pool = lib.eligible_ids()
     embeddings = store.get_embeddings(pool)
     if len(embeddings) < len(pool):
         log.info("%d eligible films aren't embedded yet and are skipped", len(pool) - len(embeddings))
@@ -201,17 +180,8 @@ def recommend(
 
     scores = score_embeddings(model, embeddings, mode)
     movies = {m.tmdb_id: m for m in session.exec(select(Movie).where(col(Movie.tmdb_id).in_(scores)))}
-    watchlist = {
-        i
-        for i in session.exec(
-            select(UserFilm.tmdb_id).where(col(UserFilm.in_watchlist).is_(True))
-        )
-        if i is not None
-    }
-    provenance = {
-        c.tmdb_id: c.sources
-        for c in session.exec(select(Candidate).where(col(Candidate.tmdb_id).in_(scores)))
-    }
+    watchlist = lib.watchlist_ids()
+    provenance = {tid: lib.candidates[tid] for tid in scores if tid in lib.candidates}
     profile_scores = (
         score_profile(
             profile, movies.values(), feature_weights or {}, reasons_per_film, min_reason_stars
@@ -219,7 +189,7 @@ def recommend(
         if profile is not None
         else {}
     )
-    folded = collab.fold_in(user_ratings(session), collab_min_user_ratings) if collab is not None else None
+    folded = collab.fold_in(lib.ratings(), collab_min_user_ratings) if collab is not None else None
     collab_scores = collab.score(folded, list(movies)) if collab is not None and folded is not None else {}
 
     blend = blend or BlendModel(mode="fixed", fixed_weights={"profile": 1.0, "embedding": 1.0, "collab": 1.0})

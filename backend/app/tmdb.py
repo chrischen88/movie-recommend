@@ -107,7 +107,7 @@ def parse_movie(details: dict[str, Any], reviews: list[dict[str, Any]]) -> Movie
         f for f in ("overview", "runtime", "release_date", "genres") if not details.get(f)
     ]
     if missing:
-        log.info("tmdb %s (%s): missing fields %s", tmdb_id, details.get("title"), missing)
+        log.debug("tmdb %s (%s): missing fields %s", tmdb_id, details.get("title"), missing)
 
     directors: list[str] = []
     for member in crew:

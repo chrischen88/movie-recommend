@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
 import { Link } from "react-router-dom";
-import { api, type RunOut, type UploadResult } from "../api";
+import { api, clearSavedFixes, hasSession, savedFixes, type RunOut, type UploadResult } from "../api";
 
 const POLL_MS = 800;
 
@@ -24,13 +24,15 @@ export default function UploadPage() {
   const [runOut, setRunOut] = useState<RunOut | null>(null);
   const timer = useRef<number | null>(null);
 
-  const poll = useCallback((runId: number) => {
+  const [fixCount, setFixCount] = useState(() => Object.keys(savedFixes()).length);
+
+  const poll = useCallback(() => {
     if (timer.current) window.clearTimeout(timer.current);
     const tick = async () => {
       try {
-        const out = await api.run(runId);
+        const out = await api.session();
         setRunOut(out);
-        if (out.run.status === "running") timer.current = window.setTimeout(tick, POLL_MS);
+        if (out && isActive(out)) timer.current = window.setTimeout(tick, POLL_MS);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       }
@@ -39,14 +41,7 @@ export default function UploadPage() {
   }, []);
 
   useEffect(() => {
-    api
-      .latestRun()
-      .then((out) => {
-        if (!out) return;
-        setRunOut(out);
-        if (out.run.status === "running") poll(out.run.id);
-      })
-      .catch(() => {});
+    if (hasSession()) poll();
     return () => {
       if (timer.current) window.clearTimeout(timer.current);
     };
@@ -59,7 +54,7 @@ export default function UploadPage() {
     try {
       const result = await api.upload(file);
       setUpload(result);
-      poll(result.run_id);
+      poll();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -70,11 +65,28 @@ export default function UploadPage() {
   const resume = async () => {
     setError(null);
     try {
-      const { run_id } = await api.resume();
-      poll(run_id);
+      setRunOut(await api.reprocess());
+      poll();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
+  };
+
+  const forget = async () => {
+    setError(null);
+    try {
+      await api.forget();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+    if (timer.current) window.clearTimeout(timer.current);
+    setRunOut(null);
+    setUpload(null);
+  };
+
+  const forgetFixes = () => {
+    clearSavedFixes();
+    setFixCount(0);
   };
 
   const onDrop = (e: DragEvent) => {
@@ -84,15 +96,19 @@ export default function UploadPage() {
     if (file) void doUpload(file);
   };
 
-  const running = runOut?.run.status === "running";
+  const running = runOut !== null && isActive(runOut);
 
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-semibold">Upload your Letterboxd export</h1>
         <p className="text-zinc-400 text-sm mt-1">
-          Letterboxd → Settings → Data → Export your data. Drop the ZIP here. Re-uploading a newer
-          export only processes what changed.
+          Letterboxd → Settings → Data → Export your data. Drop the ZIP here.
+        </p>
+        <p className="text-zinc-500 text-xs mt-2">
+          Your export is processed in memory and deleted after an hour without use, or when you click
+          "Forget my data now". Nothing about you is saved on the server. Match fixes you make are kept in
+          this browser only, and applied to your next upload.
         </p>
       </div>
 
@@ -129,6 +145,21 @@ export default function UploadPage() {
 
       {runOut && <RunPanel out={runOut} onResume={resume} />}
 
+      {(runOut || fixCount > 0) && (
+        <div className="flex flex-wrap gap-4 text-sm">
+          {runOut && (
+            <button onClick={() => void forget()} className="text-zinc-400 underline hover:text-white">
+              Forget my data now
+            </button>
+          )}
+          {fixCount > 0 && (
+            <button onClick={forgetFixes} className="text-zinc-400 underline hover:text-white">
+              Clear {fixCount} saved match fix{fixCount === 1 ? "" : "es"} from this browser
+            </button>
+          )}
+        </div>
+      )}
+
       {upload && upload.warnings.length > 0 && (
         <details className="text-sm rounded-xl border border-zinc-800 p-4">
           <summary className="cursor-pointer text-amber-400">
@@ -145,8 +176,12 @@ export default function UploadPage() {
   );
 }
 
+function isActive(out: RunOut) {
+  return out.run.status === "queued" || out.run.status === "running";
+}
+
 function RunPanel({ out, onResume }: { out: RunOut; onResume: () => void }) {
-  const { run, stages } = out;
+  const { run, stages, queue_position } = out;
   const currentIdx = run.stage === "done" ? stages.length : stages.indexOf(run.stage);
   const needsReview =
     (run.stats.matching?.low_confidence ?? 0) +
@@ -155,6 +190,12 @@ function RunPanel({ out, onResume }: { out: RunOut; onResume: () => void }) {
 
   return (
     <div className="rounded-xl border border-zinc-800 p-5 space-y-5">
+      {run.status === "queued" && (
+        <p className="rounded-md border border-sky-800 bg-sky-950/40 px-3 py-2 text-sm text-sky-200">
+          Waiting in line
+          {queue_position ? `: ${queue_position} export${queue_position === 1 ? "" : "s"} ahead of yours` : ""}…
+        </p>
+      )}
       <ol className="space-y-3">
         {stages.map((stage, i) => {
           const state =
@@ -213,7 +254,7 @@ function RunPanel({ out, onResume }: { out: RunOut; onResume: () => void }) {
           }`}
         >
           {run.message}
-          {run.status !== "running" && (
+          {!isActive(out) && (
             <button onClick={onResume} className="ml-3 underline hover:text-white">
               Run processing again
             </button>
@@ -221,18 +262,11 @@ function RunPanel({ out, onResume }: { out: RunOut; onResume: () => void }) {
         </div>
       )}
 
-      {run.stats.reset && (
-        <p className="rounded-md border border-sky-800 bg-sky-950/40 px-3 py-2 text-sm text-sky-200">
-          This export is from a different account{run.stats.account ? ` (${run.stats.account})` : ""}, so it
-          replaced all previous films, match fixes and recommendations instead of merging with them.
-        </p>
-      )}
-
       {run.status === "done" && (
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <Stat label="films" value={run.stats.films} />
           <Stat label="rated" value={run.stats.rated} />
-          <Stat label="new / changed" value={`${run.stats.added ?? 0} / ${run.stats.changed ?? 0}`} />
+          <Stat label="watchlist" value={run.stats.watchlist} />
           <Stat
             label="matched"
             value={

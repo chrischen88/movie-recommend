@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import pytest
 
-from app.blend import (BlendModel, LinearBlend, OOFRow, fit_blend, fixed_model, out_of_fold, rank_with_fit,
-                       taste_fit)
+from app.blend import OOFRow, fit_blend, fixed_model, out_of_fold, rank_with_fit, taste_fit
 from app.config import Settings
 from app.db import Movie
 
@@ -86,22 +83,6 @@ def test_ranking_metric() -> None:
     m = fit_blend(rows(120), settings())
     assert m.metrics["ranking"]["rmse"] is None and m.metrics["ranking"]["spearman"] is not None
     assert "ranking" not in fit_blend(rows(120), settings(rank_fit_weight=0)).metrics
-
-
-def test_save_load(tmp_path: Path) -> None:
-    m = fit_blend(rows(80), settings())
-    m.fingerprint = "abc"
-    m.save(tmp_path / "b.json")
-    loaded = BlendModel.load(tmp_path / "b.json")
-    assert loaded is not None and loaded.fingerprint == "abc"
-    assert isinstance(loaded.full, LinearBlend)
-    assert loaded.predict(0.3, 0.4, 0.5, 10) == pytest.approx(m.predict(0.3, 0.4, 0.5, 10))
-    assert BlendModel.load(tmp_path / "missing.json") is None
-    (tmp_path / "bad.json").write_text("{not json")
-    assert BlendModel.load(tmp_path / "bad.json") is None
-
-
-# ---------------------------------------------------------------- out-of-fold
 
 
 def library(n: int = 40, dim: int = 16) -> tuple[dict[int, Movie], dict[int, np.ndarray]]:

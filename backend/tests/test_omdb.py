@@ -6,6 +6,7 @@ from sqlmodel import Session, select
 
 from app.cache import DailyBudgetExceeded, ResponseCache
 from app.db import ApiCache, Movie
+from app.library import Library
 from app.omdb import OmdbClient, OmdbRatings, parse_ratings
 from tests.fake_omdb import FakeOmdb
 from tests.test_pipeline import fake_for_sample, make_pipeline, run, test_settings
@@ -64,41 +65,41 @@ def test_daily_budget(engine: Engine) -> None:
 # ---------------------------------------------------------------- pipeline stage
 
 
-def test_pipeline_fetches_the_shortlist_once(ingested: Engine) -> None:
+def test_pipeline_fetches_the_shortlist_once(engine: Engine, library: Library) -> None:
     fake = FakeOmdb()
-    p = make_pipeline(ingested, fake_for_sample(), omdb=fake)
-    r = run(p, ingested)
+    p = make_pipeline(engine, fake_for_sample(), omdb=fake)
+    r = run(p, library)
     stats = r.stats["omdb"]
     assert stats["fetched"] > 0 and stats["fetched"] == stats["shortlist"] - stats["no_imdb_id"]
-    with Session(ingested) as s:
+    with Session(engine) as s:
         rated = s.exec(select(Movie).where(Movie.omdb_fetched_at.is_not(None))).all()  # type: ignore[union-attr]
     assert len(rated) == stats["fetched"] and all(m.imdb_rating is not None for m in rated)
     n = len(fake.requests)
-    again = run(p, ingested).stats["omdb"]
+    again = run(p, library).stats["omdb"]
     assert again["fetched"] == 0 and len(fake.requests) == n  # already looked up
 
 
-def test_pipeline_shortlist_is_capped(ingested: Engine) -> None:
-    p = make_pipeline(ingested, fake_for_sample(), omdb=FakeOmdb())
+def test_pipeline_shortlist_is_capped(engine: Engine, library: Library) -> None:
+    p = make_pipeline(engine, fake_for_sample(), omdb=FakeOmdb())
     p.settings.omdb_shortlist_size = 3
-    assert run(p, ingested).stats["omdb"]["shortlist"] == 3
+    assert run(p, library).stats["omdb"]["shortlist"] == 3
 
 
-def test_pipeline_without_key(ingested: Engine) -> None:
-    r = run(make_pipeline(ingested, fake_for_sample()), ingested)
+def test_pipeline_without_key(engine: Engine, library: Library) -> None:
+    r = run(make_pipeline(engine, fake_for_sample()), library)
     assert r.status == "done" and "skipped" in r.stats["omdb"]
 
 
-def test_pipeline_survives_omdb_401(ingested: Engine) -> None:
-    r = run(make_pipeline(ingested, fake_for_sample(), omdb=FakeOmdb(status=401)), ingested)
+def test_pipeline_survives_omdb_401(engine: Engine, library: Library) -> None:
+    r = run(make_pipeline(engine, fake_for_sample(), omdb=FakeOmdb(status=401)), library)
     assert r.status == "done"  # recommendations don't need OMDb
     assert "skipped" in r.stats["omdb"] and r.message and "OMDb" in r.message
 
 
-def test_pipeline_stops_at_budget(ingested: Engine) -> None:
-    p = make_pipeline(ingested, fake_for_sample(), omdb=FakeOmdb())
+def test_pipeline_stops_at_budget(engine: Engine, library: Library) -> None:
+    p = make_pipeline(engine, fake_for_sample(), omdb=FakeOmdb())
     assert p.omdb is not None
     p.omdb.http.daily_limit = 2
-    r = run(p, ingested)
+    r = run(p, library)
     assert r.stats["omdb"]["fetched"] == 2 and r.stats["omdb"]["budget_exhausted"] > 0
     assert r.message and "budget" in r.message

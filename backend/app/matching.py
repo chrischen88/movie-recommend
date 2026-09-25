@@ -98,7 +98,7 @@ def match_film(
             break
 
     if not results:
-        log.warning("no TMDB match for %r (%s)", name, year)
+        log.debug("no TMDB match for %r (%s)", name, year)
         return MatchResult(None, 0.0, UNMATCHED, "no TMDB search results")
 
     scored = sorted(
@@ -129,7 +129,7 @@ def match_film(
 
     status = MATCHED if confidence >= low_threshold else LOW_CONFIDENCE
     if status == LOW_CONFIDENCE:
-        log.warning("low-confidence match for %r (%s): %.2f, %s", name, year, confidence, note)
+        log.debug("low-confidence match for %r (%s): %.2f, %s", name, year, confidence, note)
     return MatchResult(int(best["id"]), round(confidence, 3), status, note)
 
 

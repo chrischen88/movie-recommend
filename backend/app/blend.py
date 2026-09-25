@@ -17,14 +17,11 @@ ratings.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 
 import numpy as np
 
@@ -74,7 +71,6 @@ class BlendModel:
     metrics: dict = field(default_factory=dict)
     n_ratings: int = 0
     n_with_collab: int = 0
-    fingerprint: str = ""
     trained_at: str = ""
 
     # -- scoring
@@ -103,26 +99,6 @@ class BlendModel:
         total = sum(w for w, _ in present)
         return sum(w * s for w, s in present) / total if total else embedding
 
-    # -- persistence
-
-    def save(self, path: Path) -> None:
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(asdict(self), indent=1))
-        tmp.replace(path)
-
-    @classmethod
-    def load(cls, path: Path) -> BlendModel | None:
-        if not path.exists():
-            return None
-        try:
-            data = json.loads(path.read_text())
-            for key in ("full", "partial"):
-                if data.get(key):
-                    data[key] = LinearBlend(**data[key])
-            return cls(**data)
-        except (ValueError, TypeError, KeyError) as exc:
-            log.error("could not read blend model %s: %s", path, exc)
-            return None
 
 
 def taste_fit(profile: float | None, embedding: float) -> float:
@@ -305,20 +281,3 @@ def fit_blend(rows: Sequence[OOFRow], settings: Settings) -> BlendModel:
              metrics["baseline_mean"]["rmse"])
     return model
 
-
-def inputs_fingerprint(
-    ratings: Mapping[int, float], pool: Sequence[int], settings: Settings, extra: Sequence[str]
-) -> str:
-    """Changes whenever anything the blend depends on changes."""
-    raw = json.dumps({
-        "ratings": sorted(ratings.items()),
-        "pool": sorted(pool),
-        "settings": [settings.shrinkage_k, settings.feature_weights, settings.embedding_score_mode,
-                     settings.taste_cluster_min_rating, list(settings.taste_cluster_k_range),
-                     settings.taste_cluster_min_size, settings.blend_cv_folds,
-                     settings.blend_min_ratings_for_learning, list(settings.blend_fallback_weights),
-                     settings.blend_use_vote_count, settings.collab_min_item_ratings,
-                     settings.collab_min_user_ratings, settings.collab_seed, settings.rank_fit_weight],
-        "extra": list(extra),
-    }, sort_keys=True, default=str)
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
