@@ -7,7 +7,7 @@ import RecommendationsPage from "./pages/RecommendationsPage";
 import UploadPage from "./pages/UploadPage";
 
 const navClass = ({ isActive }: { isActive: boolean }) =>
-  `px-3 py-1.5 rounded-md text-sm ${isActive ? "bg-zinc-800 text-white" : "text-zinc-400 hover:text-white"}`;
+  `shrink-0 whitespace-nowrap px-1.5 sm:px-3 py-1.5 rounded-md text-sm ${isActive ? "bg-zinc-800 text-white" : "text-zinc-400 hover:text-white"}`;
 
 export default function App() {
   const [health, setHealth] = useState<Health | null>(null);
@@ -19,9 +19,10 @@ export default function App() {
   return (
     <div className="min-h-screen">
       <header className="border-b border-zinc-800">
-        <div className="mx-auto max-w-6xl px-4 py-3 flex items-center gap-4">
-          <span className="font-semibold tracking-tight">Film Picks</span>
-          <nav className="flex gap-1">
+        {/* On phones the nav wraps onto its own row and the key badges are hidden. */}
+        <div className="mx-auto max-w-6xl px-4 py-3 flex flex-wrap items-center gap-x-4 gap-y-2">
+          <span className="font-semibold tracking-tight whitespace-nowrap">Film Picks</span>
+          <nav className="order-last sm:order-none w-full sm:w-auto flex gap-0.5 sm:gap-1 overflow-x-auto">
             <NavLink to="/" className={navClass} end>
               Upload
             </NavLink>
@@ -40,7 +41,7 @@ export default function App() {
               Object.entries(health.features).map(([name, on]) => (
                 <span
                   key={name}
-                  className={`rounded px-2 py-0.5 ${on ? "bg-emerald-900/60 text-emerald-300" : "bg-zinc-800 text-zinc-500"}`}
+                  className={`hidden sm:inline rounded px-2 py-0.5 ${on ? "bg-emerald-900/60 text-emerald-300" : "bg-zinc-800 text-zinc-500"}`}
                   title={on ? `${name} key configured` : `${name} key missing — feature disabled`}
                 >
                   {name}
