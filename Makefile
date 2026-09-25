@@ -2,7 +2,7 @@ PY      := backend/.venv/bin/python
 PIP     := backend/.venv/bin/pip
 EXPORT  ?= sample_letterboxd_export.zip
 
-.PHONY: setup setup-backend setup-frontend ingest sample build-index train serve serve-api serve-web test
+.PHONY: setup setup-backend setup-frontend ingest sample build-index train serve serve-api serve-web test fly-deploy fly-push-data
 
 setup: setup-backend setup-frontend
 
@@ -41,3 +41,10 @@ serve:
 
 test:
 	cd backend && .venv/bin/python -m pytest -q
+
+# Fly.io (docs/DEPLOY.md). fly-push-data replaces the server's data with backend/data.
+fly-deploy:
+	fly deploy
+
+fly-push-data:
+	scripts/fly-push-data.sh

@@ -95,6 +95,23 @@ class Pipeline:
     def busy(self) -> bool:
         return self._lock.locked()
 
+    def fail_interrupted_runs(self) -> int:
+        """Mark runs a previous process left `running` as failed, so the UI stops
+        polling them and offers to resume. The lock lives in memory, so they died
+        with that process (a deploy, a crash, a stopped machine). Call at startup."""
+        if self.busy:
+            return 0
+        with Session(self.engine) as s:
+            stale = s.exec(select(IngestRun).where(IngestRun.status == "running")).all()
+            for run in stale:
+                run.status, run.finished_at = "error", utcnow()
+                run.message = "Interrupted: the server restarted before processing finished."
+                s.add(run)
+            s.commit()
+        if stale:
+            log.warning("marked %d interrupted run(s) as failed", len(stale))
+        return len(stale)
+
     def run(self, run_id: int) -> None:
         """Run all post-parse stages for `run_id`. Caller must hold the lock."""
         try:

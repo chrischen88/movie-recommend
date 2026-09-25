@@ -31,10 +31,18 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_model: str = "gpt-4o-mini"
 
+    # --- Access (hosted deployments) ---
+    # Setting a password puts every route except /api/health behind HTTP Basic auth.
+    auth_username: str = "letterboxd"
+    auth_password: str | None = None
+
     # --- Storage ---
     data_dir: Path = BACKEND_DIR / "data"
     db_filename: str = "app.sqlite3"
     chroma_dirname: str = "chroma"
+    # Built UI (`npm run build`). When present, the API also serves it, so one
+    # process on one port hosts the whole app; in dev, Vite serves the UI instead.
+    frontend_dist: Path = PROJECT_DIR / "frontend" / "dist"
 
     # --- HTTP cache / rate limiting ---
     # TTL in seconds per namespace; None = never expires.

@@ -2,7 +2,7 @@
 
 Tracks where the build stands against [SPEC.md](SPEC.md). Update this file at the end of every milestone.
 
-_Last updated: 2026-09-23_
+_Last updated: 2026-09-24_
 
 ## Status
 
@@ -18,7 +18,7 @@ _Last updated: 2026-09-23_
 | 7 | OpenAI layer: re-rank, explanations, natural-language requests | ⏭ Next |
 | 8 | UI polish, taste profile page, feedback loop, README | Not started |
 
-Tests: 201 passing (`make test`). The frontend type-checks and builds (`cd frontend && npm run build`).
+Tests: 209 passing (`make test`). The frontend type-checks and builds (`cd frontend && npm run build`).
 
 ## What exists (by module)
 
@@ -34,7 +34,8 @@ Tests: 201 passing (`make test`). The frontend type-checks and builds (`cd front
 - `backend/app/omdb.py`: OMDb client (IMDb rating, Rotten Tomatoes, Metascore) over `CachedHttpClient` with the daily budget.
 - `backend/app/collab.py`: score ③. Explicit ALS with biases (numpy/scipy), a saved base model, the user folded in per request, and predicted stars per candidate.
 - `backend/app/recommend.py`: scores every eligible film, ranks by the blend's predicted rating (or the fixed-weight score), adds the watchlist boost, applies `RecFilters` (min rating from TMDB/IMDb/RT/Metacritic, quality floor, genre, decade, max runtime, language), hides shorts, then re-ranks with MMR.
-- `backend/app/main.py`: FastAPI. Routes: `/api/health`, `/api/upload`, `/api/ingest/{id|latest|resume}`, `/api/films`, `/api/matches[/set|/accept|/ignore]`, `/api/recommendations`, `/api/taste`, `/api/metrics`.
+- `backend/app/main.py`: FastAPI. Routes: `/api/health`, `/api/upload`, `/api/ingest/{id|latest|resume}`, `/api/films`, `/api/matches[/set|/accept|/ignore]`, `/api/recommendations`, `/api/taste`, `/api/metrics`. When `frontend/dist` exists it also serves the built UI (any non-`/api` path falls back to `index.html`). Setting `AUTH_PASSWORD` puts everything except `/api/health` behind HTTP Basic auth. At startup, runs a previous process left `running` are marked failed (`Pipeline.fail_interrupted_runs`).
+- Deployment (Fly.io): `Dockerfile`, `fly.toml`, `deploy/start.sh`, `scripts/fly-push-data.sh` (`make fly-deploy`, `make fly-push-data`). See [DEPLOY.md](DEPLOY.md).
 - `frontend/`: Upload (progress stepper), Matches (review/fix), Recommendations (poster grid, filter bar, cluster chips, predicted "~4.5★ for you", TMDB/IMDb/RT/Metacritic ratings, ①②③ bars, up to 3 "why" lines per card) and Metrics (blend weights, held-out accuracy per method, candidate sources, MovieLens and OMDb usage) pages.
 
 ## Decisions & deviations from the spec
@@ -66,6 +67,7 @@ These are deliberate, so don't "fix" them back without reason.
 22. **Shorts are hidden** (`RECOMMEND_MIN_RUNTIME=40` minutes) unless they're on your watchlist. MovieLens users rate some classic shorts very highly (*Rabbit of Seville*), and they crowded the top.
 
 23. **The ranking mixes taste fit back in** (`RANK_FIT_WEIGHT=0.5`). In learned mode, films are ranked by the percentile of ½·pct(predicted rating) + ½·pct(taste fit), where taste fit is the mean of ① and ②. The "~4.4★ for you" on each card is still the learned prediction. Why: the learned blend puts ③ at 2.7★ and ① and ② at 0 (see the open item below), so 38 of the top 60 were below the median on ① or ② (acclaimed canon, not the user's kind of film). With the mix, that's 1 of 60, and the median predicted rating of the top 60 only drops from 4.44★ to 4.29★. Cost on held-out ratings: Spearman 0.52 for the ranking vs 0.62 for the prediction alone. That's expected, because the holdout measures *how you rate films you chose to watch*, while ② mostly captures *what you choose*. The metrics page shows both rows. Fixed mode (< 50 ratings) is unchanged, since ①② already carry 70% of the weight there.
+24. **Hosted on one Fly Machine that suspends when idle** ([DEPLOY.md](DEPLOY.md)). Serverless hosts (Vercel, Firebase/Cloud Run) don't fit: the app needs a persistent disk for SQLite and Chroma, about 2 GB of RAM for PyTorch, and background threads that outlive the request. The API serves the built UI itself, so there is one origin, one login and one deploy. 2 GB is also Fly's largest suspendable size, and suspend makes a resume take a few hundred ms instead of a PyTorch cold start. Data is built locally and uploaded (`make fly-push-data`), because the shared CPU is slow at embedding and 2 GB can't train `ml-32m`.
 
 ## Open items / known issues
 

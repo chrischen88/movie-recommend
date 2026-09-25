@@ -26,6 +26,10 @@ make serve                                    # API on :8000, UI on :5173
 
 Re-ingesting a newer export is incremental. Each film is stored with a content hash, so only added or changed films are reprocessed, and films removed from the export are deleted.
 
+## Hosting
+
+The app deploys to Fly.io as a single machine that suspends when idle (about $2–4 a month for personal use). See [docs/DEPLOY.md](docs/DEPLOY.md). Set `AUTH_PASSWORD` on any public deployment.
+
 ## Layout
 
 ```

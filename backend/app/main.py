@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
+import secrets
 from collections import Counter
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Annotated, Any, Literal
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from sqlmodel import Session, col, select
 
@@ -28,13 +34,55 @@ logging.basicConfig(
 )
 log = logging.getLogger("app")
 
-app = FastAPI(title="Letterboxd Recommender")
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # Resolved through the overrides so tests get their own pipeline and database.
+    pipeline = app.dependency_overrides.get(get_pipeline, get_pipeline)()
+    pipeline.fail_interrupted_runs()
+    yield
+
+
+app = FastAPI(title="Letterboxd Recommender", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Open without credentials: platform health checks, and waking a stopped machine.
+AUTH_EXEMPT_PATHS = {"/api/health"}
+
+
+def _authorized(header: str | None, username: str, password: str) -> bool:
+    scheme, _, encoded = (header or "").partition(" ")
+    if scheme.lower() != "basic":
+        return False
+    try:
+        user, _, pw = base64.b64decode(encoded, validate=True).decode().partition(":")
+    except (binascii.Error, UnicodeDecodeError):
+        return False
+    # Compare both, always, so timing doesn't reveal which one was wrong.
+    user_ok = secrets.compare_digest(user.encode(), username.encode())
+    pw_ok = secrets.compare_digest(pw.encode(), password.encode())
+    return user_ok and pw_ok
+
+
+@app.middleware("http")
+async def basic_auth(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+    s = get_settings()
+    if (
+        s.auth_password
+        and request.url.path not in AUTH_EXEMPT_PATHS
+        and not _authorized(request.headers.get("authorization"), s.auth_username, s.auth_password)
+    ):
+        return Response(
+            "authentication required",
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="Letterboxd Recommender", charset="UTF-8"'},
+        )
+    return await call_next(request)
+
 
 SessionDep = Annotated[Session, Depends(get_session)]
 PipelineDep = Annotated[Pipeline, Depends(get_pipeline)]
@@ -384,3 +432,25 @@ def get_taste(session: SessionDep, pipeline: PipelineDep) -> dict[str, Any]:
             for c in model.clusters
         ],
     }
+
+
+# ---------------------------------------------------------------- frontend
+
+# Vite puts content-hashed files in assets/, so they can be cached for good.
+IMMUTABLE_PREFIX = "assets/"
+
+
+@app.get("/{path:path}", include_in_schema=False)
+def frontend(path: str) -> FileResponse:
+    """Serve the built UI: a file from `frontend_dist` if one matches, otherwise
+    index.html so client-side routes (/matches, /recommendations…) load the app."""
+    dist = get_settings().frontend_dist.resolve()
+    index = dist / "index.html"
+    if path == "api" or path.startswith("api/") or not index.is_file():
+        raise HTTPException(404, "Not Found")
+    file = (dist / path).resolve()
+    if path and file.is_relative_to(dist) and file.is_file():
+        if path.startswith(IMMUTABLE_PREFIX):
+            return FileResponse(file, headers={"Cache-Control": "public, max-age=31536000, immutable"})
+        return FileResponse(file)
+    return FileResponse(index, headers={"Cache-Control": "no-cache"})

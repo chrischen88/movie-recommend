@@ -12,6 +12,7 @@ Local app that recommends films from a Letterboxd export by blending a taste-pro
 - `make serve`: API on :8000 and the UI on :5173 (the user runs this; see below)
 - `make ingest EXPORT=path.zip`, `make build-index`: CLI pipeline
 - `make train` (`FORCE=1` to retrain): download MovieLens if needed and train the score ③ model
+- `make fly-deploy`, `make fly-push-data`: deploy to Fly.io and upload `backend/data` ([docs/DEPLOY.md](docs/DEPLOY.md))
 
 ## Conventions
 

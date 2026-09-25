@@ -1,0 +1,43 @@
+# Fly.io config. Setup, secrets and data upload: docs/DEPLOY.md.
+
+# App names are global on Fly: change this to your own before `fly launch`.
+app = "letterboxd-recommender"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DATA_DIR = "/data"
+  # Must match the MovieLens model you upload (scripts/fly-push-data.sh), or the
+  # first run downloads and trains that dataset on the server. Training ml-32m
+  # needs more than 2 GB, so train it locally and upload the model.
+  MOVIELENS_DATASET = "ml-32m"
+
+# SQLite, the Chroma index and the trained models. One volume, so one machine.
+[mounts]
+  source = "data"
+  destination = "/data"
+  initial_size = "3gb"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Suspend when idle (RAM snapshot: resumes in a few hundred ms, and a pipeline
+  # run in progress continues) and wake on the next request.
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/api/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "60s"
+
+# 2 GB fits PyTorch + the embedding model during a pipeline run. It's also the
+# largest size Fly can suspend. Don't add swap: that disables suspend.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "2gb"
