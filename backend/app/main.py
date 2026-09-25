@@ -30,6 +30,7 @@ from app.cache import ResponseCache
 from app.collab import load_scorer
 from app.config import get_settings
 from app.db import Movie, get_session, utcnow
+from app.demo import demo_export_zip
 from app.letterboxd import ExportError, parse_export
 from app.library import InvalidFixes, Library, LibraryFilm, applied_fixes, library_from_export
 from app.pipeline import STAGES, Pipeline, TmdbUnavailable, get_pipeline
@@ -147,10 +148,7 @@ async def create_session(
     """Parse an export into a new in-memory session and queue its processing.
     `fixes` is the browser's saved match fixes (see library_from_export)."""
     settings = store.settings
-    try:
-        store.check_upload_rate(_client_ip(request))
-    except RateLimited as exc:
-        raise HTTPException(429, str(exc)) from exc
+    _check_upload_rate(request, store)
     data = await file.read(settings.max_upload_bytes + 1)
     if len(data) > settings.max_upload_bytes:
         raise HTTPException(413, "upload too large")
@@ -160,7 +158,29 @@ async def create_session(
         fix_map = None
     if not isinstance(fix_map, dict):
         raise HTTPException(400, "fixes must be a JSON object")
+    return await _start_session(data, fix_map, store, pipeline)
 
+
+@app.post("/api/sessions/demo")
+async def create_demo_session(request: Request, store: StoreDep, pipeline: PipelineDep) -> dict[str, object]:
+    """A session on the built-in sample profile (app/demo.py), for visitors
+    without an export. The browser's saved fixes belong to their own export, so
+    they aren't applied here."""
+    _check_upload_rate(request, store)
+    return await _start_session(demo_export_zip(), {}, store, pipeline)
+
+
+def _check_upload_rate(request: Request, store: SessionStore) -> None:
+    try:
+        store.check_upload_rate(_client_ip(request))
+    except RateLimited as exc:
+        raise HTTPException(429, str(exc)) from exc
+
+
+async def _start_session(
+    data: bytes, fix_map: dict[str, Any], store: SessionStore, pipeline: Pipeline
+) -> dict[str, object]:
+    settings = store.settings
     try:
         export = await run_in_threadpool(parse_export, data, max_csv_bytes=settings.max_uncompressed_csv_bytes)
     except ExportError as exc:

@@ -22,11 +22,11 @@ export default function App() {
         <div className="mx-auto max-w-6xl px-4 py-3 flex items-center gap-4">
           <span className="font-semibold tracking-tight">Film Picks</span>
           <nav className="flex gap-1">
-            <NavLink to="/recommendations" className={navClass}>
-              Recommendations
-            </NavLink>
             <NavLink to="/" className={navClass} end>
               Upload
+            </NavLink>
+            <NavLink to="/recommendations" className={navClass}>
+              Recommendations
             </NavLink>
             <NavLink to="/matches" className={navClass}>
               Matches

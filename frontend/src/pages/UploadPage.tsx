@@ -47,12 +47,12 @@ export default function UploadPage() {
     };
   }, [poll]);
 
-  const doUpload = async (file: File) => {
+  const start = async (begin: () => Promise<UploadResult>) => {
     setUploading(true);
     setError(null);
     setUpload(null);
     try {
-      const result = await api.upload(file);
+      const result = await begin();
       setUpload(result);
       poll();
     } catch (e) {
@@ -93,7 +93,7 @@ export default function UploadPage() {
     e.preventDefault();
     setDragging(false);
     const file = e.dataTransfer.files[0];
-    if (file) void doUpload(file);
+    if (file) void start(() => api.upload(file));
   };
 
   const running = runOut !== null && isActive(runOut);
@@ -132,12 +132,28 @@ export default function UploadPage() {
           accept=".zip"
           className="hidden"
           disabled={running || uploading}
-          onChange={(e) => e.target.files?.[0] && void doUpload(e.target.files[0])}
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) void start(() => api.upload(file));
+          }}
         />
         <span className="text-zinc-300">
           {uploading ? "Uploading…" : running ? "Processing…" : "Drag & drop ZIP, or click to choose"}
         </span>
       </label>
+
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+        <button
+          onClick={() => void start(api.demo)}
+          disabled={running || uploading}
+          className="rounded-md border border-zinc-700 px-3 py-1.5 text-zinc-200 hover:border-zinc-500 hover:text-white disabled:opacity-50"
+        >
+          Try it with a sample profile
+        </button>
+        <span className="text-zinc-500">
+          No export? See recommendations for a made-up viewer with 68 rated films.
+        </span>
+      </div>
 
       {error && (
         <div className="rounded-md bg-red-950/50 border border-red-800 p-3 text-red-300">{error}</div>

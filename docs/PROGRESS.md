@@ -2,7 +2,7 @@
 
 Tracks where the build stands against [SPEC.md](SPEC.md). Update this file at the end of every milestone.
 
-_Last updated: 2026-09-24_
+_Last updated: 2026-09-25_
 
 ## Status
 
@@ -16,10 +16,11 @@ _Last updated: 2026-09-24_
 | 5 | MovieLens ingestion + score ③ | ✅ Done |
 | 6 | Candidate gen (discover), OMDb, learned blend, MMR, metrics page | ✅ Done |
 | — | Hosted multi-user service: in-memory sessions, shared film cache (requested outside the plan) | ✅ Done |
+| — | Sample-profile demo button (requested outside the plan) | ✅ Done |
 | 7 | OpenAI layer: re-rank, explanations, natural-language requests | ⏭ Next |
 | 8 | UI polish, taste profile page, feedback loop, README | Not started |
 
-Tests: 217 passing (`make test`). The frontend type-checks and builds (`cd frontend && npm run build`).
+Tests: 220 passing (`make test`). The frontend type-checks and builds (`cd frontend && npm run build`).
 
 ## What exists (by module)
 
@@ -27,6 +28,7 @@ Tests: 217 passing (`make test`). The frontend type-checks and builds (`cd front
 - `backend/app/cache.py`: SQLite response cache with TTL, rate limiter, retry/backoff client, and an optional daily budget (for OMDb).
 - `backend/app/library.py`: a user's `Library` (films with their TMDB matches, candidates, taste model, blend), held in memory only. `library_from_export` applies the match fixes the browser sends with each upload.
 - `backend/app/sessions.py`: `SessionStore`, the in-memory sessions (random 256-bit id in the `X-Session-Id` header, dropped after `SESSION_TTL_SECONDS` idle, on delete, or on restart), the per-IP upload limit, and the single-worker run queue with its caps (decision 25).
+- `backend/app/demo.py`: the built-in sample profile (68 rated films, 6 on the watchlist) as an in-memory export ZIP, served by `POST /api/sessions/demo` (decision 27).
 - `backend/app/tmdb.py`, `matching.py`: TMDB client and title/year matching with confidence scores.
 - `backend/app/pipeline.py`: one run per session over its `Library`: matching → enrichment → collab → candidates → embedding → taste → blend → omdb. Film data it learns is shared (`Movie`, `ApiCache`, the Chroma index), so a second user with the same films makes no API calls. A deleted or expired session stops its run at the next check. At startup `purge_user_data` drops what older versions stored (user tables, model files, the index's `seen` flags). The collab stage trains once, then is a no-op until the settings change; if MovieLens can't be fetched it's skipped with a message, and the run still succeeds. Candidates come from four sources: TMDB recommendations and similar lists for the top 60 films rated ≥ 4.0 (`CANDIDATE_SEED_COUNT`, was 25), `/discover/movie` for the profile's best genres and non-English languages, and ③'s top predictions. The taste model and blend are fitted fresh for each run, in memory. The OMDb stage fetches the top-150 shortlist once per `CACHE_TTL_OMDB`; a bad key or an exhausted budget skips it without failing the run.
 - `backend/app/embeddings.py`, `vectorstore.py`, `taste.py`: film documents, the `OnnxEmbedder` (decision 26), the `VectorStore` interface (Chroma + in-memory), the taste vector, clusters, and score ②.
@@ -36,9 +38,9 @@ Tests: 217 passing (`make test`). The frontend type-checks and builds (`cd front
 - `backend/app/omdb.py`: OMDb client (IMDb rating, Rotten Tomatoes, Metascore) over `CachedHttpClient` with the daily budget.
 - `backend/app/collab.py`: score ③. Explicit ALS with biases (numpy/scipy), a saved base model, the user folded in per request, and predicted stars per candidate.
 - `backend/app/recommend.py`: scores every eligible film, ranks by the blend's predicted rating (or the fixed-weight score), adds the watchlist boost, applies `RecFilters` (min rating from TMDB/IMDb/RT/Metacritic, quality floor, genre, decade, max runtime, language), hides shorts, then re-ranks with MMR.
-- `backend/app/main.py`: FastAPI. Routes: `/api/health`, `POST /api/sessions` (upload + saved fixes), `GET|DELETE /api/session`, `POST /api/session/reprocess`, `/api/matches[/set|/accept|/ignore]`, `/api/recommendations`, `/api/taste`, `/api/metrics`. Everything but health and upload needs `X-Session-Id`; a missing or expired session is 410. When `frontend/dist` exists it also serves the built UI (any non-`/api` path falls back to `index.html`). Setting `AUTH_PASSWORD` puts everything except `/api/health` behind HTTP Basic auth. `httpx` request logging is off: its URLs carry film titles and API keys.
+- `backend/app/main.py`: FastAPI. Routes: `/api/health`, `POST /api/sessions` (upload + saved fixes), `POST /api/sessions/demo` (the sample profile), `GET|DELETE /api/session`, `POST /api/session/reprocess`, `/api/matches[/set|/accept|/ignore]`, `/api/recommendations`, `/api/taste`, `/api/metrics`. Everything but health and upload needs `X-Session-Id`; a missing or expired session is 410. When `frontend/dist` exists it also serves the built UI (any non-`/api` path falls back to `index.html`). Setting `AUTH_PASSWORD` puts everything except `/api/health` behind HTTP Basic auth. `httpx` request logging is off: its URLs carry film titles and API keys.
 - Deployment (Fly.io): `Dockerfile`, `fly.toml`, `deploy/start.sh`, `scripts/fly-push-data.sh` (`make fly-deploy`, `make fly-push-data`). See [DEPLOY.md](DEPLOY.md).
-- `frontend/`: `api.ts` keeps the session id and the match fixes in localStorage. Upload (progress stepper, queue position, "Forget my data now", privacy note), Matches (review/fix), Recommendations (poster grid, filter bar, cluster chips, predicted "~4.5★ for you", TMDB/IMDb/RT/Metacritic ratings, ①②③ bars, up to 3 "why" lines per card) and Metrics (blend weights, held-out accuracy per method, candidate sources, MovieLens and OMDb usage) pages.
+- `frontend/`: `api.ts` keeps the session id and the match fixes in localStorage. The nav reads Upload, Recommendations, Matches, Metrics. Upload (a "Try it with a sample profile" button, progress stepper, queue position, "Forget my data now", privacy note), Matches (review/fix), Recommendations (poster grid, filter bar, cluster chips, predicted "~4.5★ for you", TMDB/IMDb/RT/Metacritic ratings, ①②③ bars, up to 3 "why" lines per card) and Metrics (blend weights, held-out accuracy per method, candidate sources, MovieLens and OMDb usage) pages.
 
 ## Decisions & deviations from the spec
 
@@ -80,6 +82,8 @@ These are deliberate, so don't "fix" them back without reason.
     - Future features must follow this too: e.g. M7's per-review LLM outputs can only be cached in the session, not on disk.
 
 26. **Embeddings run on ONNX Runtime, not PyTorch.** `OnnxEmbedder` runs the model's own ONNX export (`onnx/model.onnx` in the `BAAI/bge-small-en-v1.5` repo) with CLS pooling and L2 normalization, which is what sentence-transformers does for BGE. The vectors are identical (min cosine 1.000000 over 515 film documents), so the model name and every `doc_hash` stay the same and the existing index is still valid. On the Fly `performance-1x` CPU: loads in 4.2 s (PyTorch 13 s) and embeds 4.5 films/s (PyTorch 3). Texts are embedded 8 per model call (`EMBEDDING_MODEL_BATCH_SIZE`): peak memory grows with batch × length², and 64 long documents needed ~3 GB (the server was OOM-killed) for no speed gain. Texts are sorted by length before batching so little compute goes to padding. Further speed-ups not tried yet: int8 quantization, or a shorter max length; both change the vectors, so the index would have to be re-embedded under a new model name.
+
+27. **A built-in sample profile for visitors without an export** (`app/demo.py`). Most people who follow a shared link (recruiters, friends without Letterboxd) have no export to upload. The demo is a made-up viewer (arthouse/international and cerebral sci-fi high, franchise blockbusters low) with 68 ratings, above `BLEND_MIN_RATINGS_FOR_LEARNING`, so the learned blend and the metrics page show real content. Titles were picked to be unambiguous: all 74 match TMDB with no review. It goes through the same path as an upload (parse, rate limit, caps, queue), and the browser's saved fixes aren't applied to it. Cost: the first demo on a cold film cache took 202 s locally (TMDB fetches + embedding ~1,300 films); after that a demo session takes ~1 s. So warm it before sharing the link: run the demo once against local `backend/data` and `make fly-push-data`, or click it once on the server after a deploy. Keep the "68 rated films" caption in `UploadPage.tsx` in sync with `demo.RATED`.
 
 ## Open items / known issues
 

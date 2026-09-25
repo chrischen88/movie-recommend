@@ -231,7 +231,7 @@ let sessionEnded = false;
 export const noSessionMessage = () =>
   sessionEnded
     ? "Your session ended (it's deleted after an hour without use). Upload your export again."
-    : "Upload your Letterboxd export to get started.";
+    : "Upload your Letterboxd export, or try the sample profile, to get started.";
 
 export function savedFixes(): Record<string, MatchFix> {
   try {
@@ -297,17 +297,23 @@ const saving = (row: Promise<MatchRow>, fix: (r: MatchRow) => MatchFix | null) =
     return r;
   });
 
+async function startSession(upload: Promise<UploadResult>): Promise<UploadResult> {
+  const result = await upload;
+  setSessionId(result.session_id);
+  sessionEnded = false;
+  return result;
+}
+
 export const api = {
   health: () => request<Health>("/api/health"),
   upload: async (file: File) => {
     const body = new FormData();
     body.append("file", file);
     body.append("fixes", JSON.stringify(savedFixes()));
-    const result = await request<UploadResult>("/api/sessions", { method: "POST", body });
-    setSessionId(result.session_id);
-    sessionEnded = false;
-    return result;
+    return startSession(request<UploadResult>("/api/sessions", { method: "POST", body }));
   },
+  /** A session on the built-in sample profile, for visitors without an export. */
+  demo: () => startSession(request<UploadResult>("/api/sessions/demo", { method: "POST" })),
   session: () => withSession<RunOut | null>(() => request<RunOut>("/api/session"), () => null),
   reprocess: () => request<RunOut>("/api/session/reprocess", { method: "POST" }),
   forget: async () => {

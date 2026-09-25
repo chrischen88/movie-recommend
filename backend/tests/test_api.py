@@ -9,8 +9,10 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine, inspect
 from sqlmodel import Session
 
+from app import demo
+from app.config import get_settings
 from app.db import get_session
-from app.letterboxd import make_film_key
+from app.letterboxd import make_film_key, parse_export
 from app.library import Library
 from app.main import app
 from app.pipeline import get_pipeline
@@ -400,3 +402,28 @@ def test_upload_limits(engine: Engine, sample_zip: bytes) -> None:
         limited = c.post("/api/sessions", files={"file": ("e.zip", sample_zip, "application/zip")})
         assert limited.status_code == 429
     app.dependency_overrides.clear()
+
+
+def test_demo_export_is_clean_and_big_enough_to_learn() -> None:
+    export = parse_export(demo.demo_export_zip())
+    assert export.warnings == []
+    assert export.username == demo.USERNAME
+    assert len(export.rated) == len(demo.RATED) >= get_settings().blend_min_ratings_for_learning
+    assert len(export.watchlist) == len(demo.WATCHLIST)
+
+
+def test_demo_session(client: TestClient) -> None:
+    resp = client.post("/api/sessions/demo")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["stats"]["films"] == len(demo.RATED) + len(demo.WATCHLIST)
+    assert body["stats"]["fixes_applied"] == 0
+    client.headers["X-Session-Id"] = body["session_id"]
+    assert client.get("/api/session").json()["run"]["status"] == "done"
+
+
+def test_demo_session_shares_the_upload_rate_limit(client: TestClient, sample_zip: bytes) -> None:
+    store_of().settings.uploads_per_ip_per_hour = 2
+    upload(client, sample_zip)
+    assert client.post("/api/sessions/demo").status_code == 200
+    assert client.post("/api/sessions/demo").status_code == 429
