@@ -9,3 +9,4 @@ frontend/node_modules/
 frontend/dist/
 sample_letterboxd_export.zip
 .DS_Store
+graphify-out
