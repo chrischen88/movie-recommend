@@ -72,42 +72,67 @@ def test_constrain_order_never_moves_a_film_too_far(seed: int) -> None:
 # ---------------------------------------------------------------- re-rank
 
 
-def test_rerank_reorders_the_pool_and_explains(engine: Engine) -> None:
+def test_rerank_reorders_the_pool_and_explains_in_batches(engine: Engine) -> None:
+    from app.recommend import SimilarFilm
+
     llm = FakeLLM()
-    svc = service(engine, llm, llm_rerank_pool=4, llm_max_position_shift=10)
-    recs = [rec(t) for t in (1, 2, 3, 4, 5)]
-    items, whys = rerank(svc, LLMSessionState(), recs, [RatedExample("Arrival", 2016, 5.0)], [], svc.settings)
-    assert [r.tmdb_id for r in items] == [4, 3, 2, 1, 5]  # pool reversed, the rest unchanged
-    assert whys[4] == "Because of Film 4."
-    name, prompt = llm.calls[0]
-    assert name == "rerank" and "Arrival (2016): 5★" in prompt and '"title": "Film 5"' not in prompt
+    svc = service(engine, llm, llm_rerank_pool=4, llm_max_position_shift=10, llm_explain_count=5, llm_explain_batch=2)
+    recs = [rec(t) for t in (1, 2, 3, 4, 5, 6)]
+    recs[0].similar_rated = [SimilarFilm("Yi Yi", 2000, 5.0)]
+    out = rerank(svc, LLMSessionState(), recs, [RatedExample("Arrival", 2016, 5.0)], [], svc.settings)
+    assert out.reordered and out.message is None
+    assert [r.tmdb_id for r in out.items] == [4, 3, 2, 1, 5, 6]  # pool reversed, the rest unchanged
+    assert out.whys == {t: f"Because of Film {t}." for t in (1, 2, 3, 4, 5)}  # the top 5, not 6
+    names = sorted(name for name, _ in llm.calls)
+    assert names == ["explain", "explain", "explain", "rerank"]  # 5 films in batches of 2
+    rank_prompt = next(u for n, u in llm.calls if n == "rerank")
+    assert "Arrival (2016): 5★" in rank_prompt and '"title": "Film 5"' not in rank_prompt
+    assert any("Yi Yi (2000): 5★" in u for n, u in llm.calls if n == "explain")  # the evidence
 
 
 def test_rerank_drops_films_the_model_made_up(engine: Engine) -> None:
-    llm = FakeLLM(lambda *_: {"picks": [{"n": 7, "title": "Invented Film", "why": "Invented."},
-                                        {"n": 2, "title": "Film 2", "why": "Real."}]})
-    svc = service(engine, llm)
-    items, whys = rerank(svc, LLMSessionState(), [rec(1), rec(2)], [], [], svc.settings)
-    assert [r.tmdb_id for r in items] == [2, 1] and whys == {2: "Real."}
-    nothing = FakeLLM(lambda *_: {"picks": [{"n": 9, "title": "Invented Film", "why": "Invented."}]})
-    with pytest.raises(LLMUnavailable):
-        rerank(service(engine, nothing), LLMSessionState(), [rec(1), rec(2)], [], [], svc.settings)
+    def answer(name: str, _s: str, _u: str) -> dict:
+        if name == "rerank":
+            return {"picks": [{"n": 7, "title": "Invented Film"}, {"n": 2, "title": "Film 2"}]}
+        return {"explanations": [{"n": 9, "title": "Invented Film", "why": "Invented."},
+                                 {"n": 2, "title": "Film 2", "why": "Real."}]}
+
+    svc = service(engine, FakeLLM(answer))
+    out = rerank(svc, LLMSessionState(), [rec(1), rec(2)], [], [], svc.settings)
+    assert [r.tmdb_id for r in out.items] == [2, 1] and out.whys == {2: "Real."}
+    nothing = FakeLLM(lambda name, *_: {"picks": [{"n": 9, "title": "Invented Film"}], "explanations": []})
+    out = rerank(service(engine, nothing), LLMSessionState(), [rec(1), rec(2)], [], [], svc.settings)
+    assert not out.reordered and out.message == "the model returned no valid picks"
+    assert [r.tmdb_id for r in out.items] == [1, 2]
 
 
 def test_rerank_never_puts_an_explanation_on_the_wrong_film(engine: Engine) -> None:
     pool = [rec(10, title="Le Trou"), rec(11, title="City of God"), rec(12, title="Heat"), rec(13, title="Ran")]
-    llm = FakeLLM(lambda *_: {"picks": [
+    picks = [
         # Wrong number, but the title names a candidate: the sentence goes on City of God.
         {"n": 1, "title": "City of God", "why": "Like City of God."},
         # Right number and title (an article and a year are ignored).
         {"n": 3, "title": "Heat (1995)", "why": "Like Heat."},
         # Number and title disagree and the title names nothing: dropped.
         {"n": 4, "title": "Rashomon", "why": "Like Rashomon."},
-    ]})
+    ]
+    llm = FakeLLM(lambda name, *_: {"picks": picks} if name == "rerank" else {"explanations": picks})
     svc = service(engine, llm, llm_max_position_shift=10)
-    items, whys = rerank(svc, LLMSessionState(), pool, [], [], svc.settings)
-    assert whys == {11: "Like City of God.", 12: "Like Heat."}
-    assert [r.tmdb_id for r in items][:2] == [11, 12]
+    out = rerank(svc, LLMSessionState(), pool, [], [], svc.settings)
+    assert out.whys == {11: "Like City of God.", 12: "Like Heat."}
+    assert [r.tmdb_id for r in out.items][:2] == [11, 12]
+
+
+def test_rerank_keeps_explanations_when_ranking_fails(engine: Engine) -> None:
+    def answer(name: str, _s: str, user: str) -> dict:
+        if name == "rerank":
+            raise LLMUnavailable("OpenAI call failed: APITimeoutError")
+        return FakeLLM()._default(name, _s, user)
+
+    svc = service(engine, FakeLLM(answer))
+    out = rerank(svc, LLMSessionState(), [rec(1), rec(2), rec(3)], [], [], svc.settings)
+    assert not out.reordered and "failed" in (out.message or "")
+    assert [r.tmdb_id for r in out.items] == [1, 2, 3] and len(out.whys) == 3
 
 
 # ---------------------------------------------------------------- service
@@ -193,6 +218,13 @@ def test_template_why() -> None:
             collab_predicted=4.2)
     assert template_why(r) == (
         "You rate Denis Villeneuve's films highly, it fits your Science Fiction · Drama streak"
+        " and viewers with similar ratings give it ~4.2★."
+    )
+    from app.recommend import SimilarFilm
+
+    r.similar_rated = [SimilarFilm("Arrival", 2016, 5.0), SimilarFilm("Stalker", 1979, 4.5), SimilarFilm("Her", 2013, 4.0)]
+    assert template_why(r) == (
+        "It's close to your 5★ Arrival and 4.5★ Stalker, you rate Denis Villeneuve's films highly"
         " and viewers with similar ratings give it ~4.2★."
     )
     assert template_why(rec(2)) == "It's close to your overall taste."

@@ -26,6 +26,15 @@ from app.vectorstore import VectorStore
 log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class SimilarFilm:
+    """One of the user's highly rated films that a recommendation resembles."""
+
+    title: str
+    year: int | None
+    rating: float
+
+
 @dataclass
 class Recommendation:
     tmdb_id: int
@@ -57,6 +66,7 @@ class Recommendation:
     metacritic: int | None = None
     why: str | None = None  # one-sentence explanation (app/llm.py)
     why_source: str | None = None  # "llm" | "template"
+    similar_rated: list[SimilarFilm] = field(default_factory=list)  # closest films you rated highly
     query_match: float | None = None  # percentile match to a natural-language request, 0–1
 
 

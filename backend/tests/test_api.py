@@ -491,10 +491,13 @@ def test_llm_rerank_reorders_and_explains(client: TestClient, sample_zip: bytes)
     assert len(ids) == 3 and ids != [r["tmdb_id"] for r in plain]
     assert all(r["why_source"] == "llm" and r["why"] == f"Because of {r['title']}." for r in body["items"])
     # Same list again: answered from the session's cache.
+    calls = len(llm.calls)
+    assert sorted({name for name, _ in llm.calls}) == ["explain", "rerank"]
     client.get("/api/recommendations", params={"limit": 3, "rerank": True})
-    assert len(llm.calls) == 1
+    assert len(llm.calls) == calls
     usage = client.get("/api/metrics").json()["llm"]
-    assert usage["enabled"] and usage["session"]["calls"] == 1 and usage["all_time"]["prompt_tokens"] == 1000
+    assert usage["enabled"] and usage["session"]["calls"] == calls
+    assert usage["all_time"]["prompt_tokens"] == 1000 * calls
 
 
 def test_llm_failure_keeps_the_blended_order(client: TestClient, sample_zip: bytes) -> None:

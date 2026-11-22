@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import re
 from collections.abc import Callable
 from typing import Any
@@ -28,16 +29,20 @@ class FakeLLM:
         }
         self.fail = fail
         self.calls: list[tuple[str, str]] = []
+        self._lock = threading.Lock()
 
     def _default(self, name: str, system: str, user: str) -> dict[str, Any]:
+        cands = [json.loads(line) for line in user.splitlines() if line.startswith('{"n": ')]
         if name == "rerank":
-            cands = [json.loads(line) for line in user.splitlines() if line.startswith('{"n": ')]
-            return {"picks": [{"n": c["n"], "title": c["title"], "why": f"Because of {c['title']}."}
-                              for c in reversed(cands)]}
+            return {"picks": [{"n": c["n"], "title": c["title"]} for c in reversed(cands)]}
+        if name == "explain":
+            return {"explanations": [{"n": c["n"], "title": c["title"], "why": f"Because of {c['title']}."}
+                                     for c in cands]}
         return dict(self.request_answer)
 
     def complete_json(self, system: str, user: str, name: str, schema: dict[str, Any]) -> LLMResult:
-        self.calls.append((name, user))
+        with self._lock:  # explain batches run in parallel
+            self.calls.append((name, user))
         if self.fail:
             raise LLMUnavailable("OpenAI call failed: APITimeoutError")
         data = self.respond(name, system, user)

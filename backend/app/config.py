@@ -154,15 +154,21 @@ class Settings(BaseSettings):
 
     # --- LLM (app/llm.py; everything works without OPENAI_API_KEY) ---
     llm_rerank_pool: int = 30  # blended top N sent to the model
-    llm_rerank_keep: int = 20  # films it orders and explains
+    llm_rerank_keep: int = 20  # films it puts first, in its preferred order
+    # Explanations are separate calls of llm_explain_batch films each, run in
+    # parallel with the ranking call: one long answer gets generic toward its end.
+    llm_explain_count: int = 40  # top films given an AI explanation (the rest get templates)
+    llm_explain_batch: int = 10
+    similar_rated_count: int = 3  # your closest highly rated films, the evidence for each "why"
     llm_max_position_shift: int = 10  # max places it may move a film, either way
     llm_liked_examples: int = 15  # your top-rated films shown to it
     llm_disliked_examples: int = 10  # and your lowest-rated
     llm_timeout_seconds: float = 30.0
     # Cost guards for a public deployment: calls across all users per UTC day,
     # and per session. Cached answers don't count.
-    llm_daily_call_limit: int = 500  # 0 = unlimited
-    llm_calls_per_session: int = 40  # 0 = unlimited
+    # A re-ranked page is 1 ranking + llm_explain_count / llm_explain_batch calls (5).
+    llm_daily_call_limit: int = 2000  # 0 = unlimited
+    llm_calls_per_session: int = 100  # 0 = unlimited
     # USD per million tokens, for the cost shown on the metrics page (gpt-4o-mini's).
     llm_price_input_per_mtok: float = 0.15
     llm_price_output_per_mtok: float = 0.60

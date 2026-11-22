@@ -22,6 +22,7 @@ import logging
 import re
 import threading
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
@@ -217,10 +218,13 @@ def template_why(r: Recommendation) -> str:
     """A one-sentence explanation from the top contributing features, used when
     there's no LLM explanation."""
     parts: list[str] = []
+    if r.similar_rated:
+        near = [f"{_stars(f.rating)} {f.title}" for f in r.similar_rated[:2]]
+        parts.append("it's close to your " + " and ".join(near))
     liked = [c for c in r.profile_reasons if c.stars > 0]
     if liked:
         parts.append(_feature_phrase(liked[0].type, liked[0].value))
-    if r.source.startswith("cluster:"):
+    if r.source.startswith("cluster:") and not r.similar_rated:
         label = re.sub(r" \(\d+\)$", "", r.source_label)  # "Drama · Romance (2)": the 2 means nothing to a reader
         parts.append(f"it fits your {label} streak")
     elif not parts:
@@ -229,6 +233,10 @@ def template_why(r: Recommendation) -> str:
         parts.append(f"viewers with similar ratings give it ~{r.collab_predicted:.1f}★")
     text = ", ".join(parts[:-1]) + (" and " if len(parts) > 1 else "") + parts[-1]
     return text[0].upper() + text[1:] + "."
+
+
+def _stars(rating: float) -> str:
+    return f"{rating:g}★"
 
 
 LANGUAGES = {
@@ -257,32 +265,40 @@ def _feature_phrase(kind: str, value: str) -> str:
 # ---------------------------------------------------------------- re-rank
 
 
-RERANK_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "picks": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {"n": {"type": "integer"}, "title": {"type": "string"}, "why": {"type": "string"}},
-                "required": ["n", "title", "why"],
-                "additionalProperties": False,
-            },
-        }
-    },
-    "required": ["picks"],
-    "additionalProperties": False,
-}
+def _picks_schema(key: str, with_why: bool) -> dict[str, Any]:
+    props: dict[str, Any] = {"n": {"type": "integer"}, "title": {"type": "string"}}
+    if with_why:
+        props["why"] = {"type": "string"}
+    return {
+        "type": "object",
+        "properties": {key: {"type": "array", "items": {
+            "type": "object", "properties": props, "required": list(props), "additionalProperties": False,
+        }}},
+        "required": [key],
+        "additionalProperties": False,
+    }
 
-RERANK_SYSTEM = """You help a film recommender pick and explain films for one viewer.
-You get the viewer's highest- and lowest-rated films and a list of candidate films the
-recommender already ranked, with its scores. Choose the {keep} candidates this viewer is
-most likely to love and order them best first. For each pick give its candidate number
-`n` and its exact `title` (copied from that candidate), then one sentence (at most 25
-words, second person) on why they'll like it, pointing to films they rated when that helps.
-The sentence must be about that candidate and no other.
-Rules: use only candidates from the list; never add or invent films; don't state facts
-that aren't in the data you were given."""
+
+RANK_SCHEMA = _picks_schema("picks", with_why=False)
+EXPLAIN_SCHEMA = _picks_schema("explanations", with_why=True)
+
+RANK_SYSTEM = """You help a film recommender order its picks for one viewer.
+You get the viewer's highest- and lowest-rated films and a numbered list of candidate films
+the recommender already ranked, with its scores. Choose the {keep} candidates this viewer
+is most likely to love and order them best first. For each pick give its candidate number
+`n` and its exact `title`, copied from that candidate. Use only candidates from the list."""
+
+EXPLAIN_SYSTEM = """You write one-sentence film recommendations for one viewer.
+For every numbered candidate, return its number `n`, its exact `title`, and `why`: one
+sentence (at most 28 words, second person) on why this viewer will like this film.
+Make each sentence specific:
+- Name at least one film from the candidate's `your_similar_films` (the viewer's own highly
+  rated films closest to it) or a `profile_reasons` item, and say what connects them.
+- Say something concrete about this candidate from its data (director, setting, premise,
+  theme from the overview, era).
+- Don't use stock phrases ("emotional depth", "resonate with your appreciation",
+  "profound", "you'll love") and don't start every sentence the same way.
+- Every sentence must be about its own candidate; use only facts in the data given."""
 
 
 @dataclass(frozen=True)
@@ -292,37 +308,49 @@ class RatedExample:
     rating: float
 
 
-def rerank_prompt(
+def _film_line(e: RatedExample) -> str:
+    return f"- {e.title} ({e.year or '?'}): {e.rating:g}★"
+
+
+def _viewer_lines(liked: Sequence[RatedExample], disliked: Sequence[RatedExample]) -> list[str]:
+    return ["Viewer's highest-rated films:", *map(_film_line, liked), "",
+            "Viewer's lowest-rated films:", *map(_film_line, disliked), ""]
+
+
+def _pct(v: float | None) -> str:
+    return "n/a" if v is None else f"{round(100 * v)}"
+
+
+def rank_prompt(
     recs: Sequence[Recommendation], liked: Sequence[RatedExample], disliked: Sequence[RatedExample], keep: int
 ) -> tuple[str, str]:
-    def film(e: RatedExample) -> str:
-        return f"- {e.title} ({e.year or '?'}): {e.rating:g}★"
-
-    def pct(v: float | None) -> str:
-        return "n/a" if v is None else f"{round(100 * v)}"
-
-    lines = ["Viewer's highest-rated films:", *map(film, liked), "", "Viewer's lowest-rated films:", *map(film, disliked),
-             "", "Candidates (recommender's order; scores are percentiles, 100 = best match):"]
+    lines = [*_viewer_lines(liked, disliked), "Candidates (recommender's order; scores are percentiles, 100 = best match):"]
     for n, r in enumerate(recs, start=1):
         ext = [f"IMDb {r.imdb_rating:g}" if r.imdb_rating is not None else "",
                f"RT {r.rt_score}%" if r.rt_score is not None else ""]
-        reasons = "; ".join(c.label for c in r.profile_reasons[:3] if c.stars > 0)
         lines.append(json.dumps({
-            "n": n,
-            "title": r.title,
-            "year": r.year,
-            "genres": r.genres,
-            "directors": r.directors[:2],
-            "overview": (r.overview or "")[:300],
-            "taste_profile": pct(r.profile_score),
-            "embedding_similarity": pct(r.embedding_score),
-            "similar_viewers": pct(r.collab_score),
+            "n": n, "title": r.title, "year": r.year, "genres": r.genres, "directors": r.directors[:2],
+            "taste_profile": _pct(r.profile_score), "embedding_similarity": _pct(r.embedding_score),
+            "similar_viewers": _pct(r.collab_score),
             "predicted_stars": None if r.predicted_rating is None else round(r.predicted_rating, 1),
-            "matches_cluster": r.source_label,
-            "profile_reasons": reasons,
             "critics": ", ".join(x for x in ext if x) or None,
         }, ensure_ascii=False))
-    return RERANK_SYSTEM.format(keep=keep), "\n".join(lines)
+    return RANK_SYSTEM.format(keep=keep), "\n".join(lines)
+
+
+def explain_prompt(
+    recs: Sequence[Recommendation], liked: Sequence[RatedExample], disliked: Sequence[RatedExample]
+) -> tuple[str, str]:
+    lines = [*_viewer_lines(liked, disliked), "Candidates:"]
+    for n, r in enumerate(recs, start=1):
+        lines.append(json.dumps({
+            "n": n, "title": r.title, "year": r.year, "genres": r.genres, "directors": r.directors[:2],
+            "overview": (r.overview or "")[:400],
+            "your_similar_films": [f"{f.title} ({f.year or '?'}): {f.rating:g}★" for f in r.similar_rated],
+            "profile_reasons": [c.label for c in r.profile_reasons[:3] if c.stars > 0],
+            "taste_cluster": None if r.source == "taste" else r.source_label,
+        }, ensure_ascii=False))
+    return EXPLAIN_SYSTEM, "\n".join(lines)
 
 
 def constrain_order(original: Sequence[int], proposed: Sequence[int], max_shift: int) -> list[int]:
@@ -360,7 +388,7 @@ def _same_title(a: str, b: str) -> bool:
 
 
 def _resolve_pick(pool: Sequence[Recommendation], n: object, title: str) -> tuple[Recommendation | None, str]:
-    """Which candidate a pick is about. Its number and title must agree. The
+    """Which candidate a pick is about. Its number and title must agree. A
     sentence is written about the title, so when the number points elsewhere
     but the title names exactly one candidate, that candidate wins; otherwise
     the pick is dropped rather than risk an explanation on the wrong film."""
@@ -373,6 +401,31 @@ def _resolve_pick(pool: Sequence[Recommendation], n: object, title: str) -> tupl
     return None, "dropped"
 
 
+def _resolve_all(pool: Sequence[Recommendation], picks: Sequence[dict[str, Any]], what: str) -> list[tuple[Recommendation, dict[str, Any]]]:
+    out: list[tuple[Recommendation, dict[str, Any]]] = []
+    seen: set[int] = set()
+    moved = dropped = 0
+    for p in picks:
+        r, how = _resolve_pick(pool, p.get("n"), str(p.get("title", "")))
+        if r is None or r.tmdb_id in seen:
+            dropped += 1
+            continue
+        moved += how == "by_title"
+        seen.add(r.tmdb_id)
+        out.append((r, p))
+    if dropped or moved:
+        log.warning("llm %s: %d picks dropped (unknown, mismatched or repeated), %d matched by title", what, dropped, moved)
+    return out
+
+
+@dataclass
+class RerankResult:
+    items: list[Recommendation]
+    whys: dict[int, str]  # tmdb_id → the model's explanation
+    reordered: bool
+    message: str | None = None  # why something didn't work, if it didn't
+
+
 def rerank(
     service: LLMService,
     state: LLMSessionState,
@@ -380,35 +433,55 @@ def rerank(
     liked: Sequence[RatedExample],
     disliked: Sequence[RatedExample],
     settings: Settings,
-) -> tuple[list[Recommendation], dict[int, str]]:
-    """The first `llm_rerank_pool` films in the model's order (within
-    `llm_max_position_shift` of their blended rank), then the rest unchanged, and
-    the model's "why" per film. Raises LLMUnavailable, or when the model's answer
-    has no usable picks."""
+) -> RerankResult:
+    """One call orders the first `llm_rerank_pool` films (each kept within
+    `llm_max_position_shift` of its blended rank); in parallel, the first
+    `llm_explain_count` films are explained in batches of `llm_explain_batch`.
+    The order only changes within the pool, so the explained films are the same
+    whatever the ranking call decides. Never raises: failures fall back to the
+    blended order and template explanations, with a message."""
     pool = list(recs[: settings.llm_rerank_pool])
-    if len(pool) < 2:
-        return list(recs), {}
-    keep = min(settings.llm_rerank_keep, len(pool))
-    system, user = rerank_prompt(pool, liked, disliked, keep)
-    data = service.call(state, system, user, "rerank", RERANK_SCHEMA)
-    whys: dict[int, str] = {}
+    to_explain = list(recs[: settings.llm_explain_count])
+    batches = [to_explain[i:i + max(1, settings.llm_explain_batch)]
+               for i in range(0, len(to_explain), max(1, settings.llm_explain_batch))]
+
+    def rank() -> list[int]:
+        if len(pool) < 2:
+            return []
+        system, user = rank_prompt(pool, liked, disliked, min(settings.llm_rerank_keep, len(pool)))
+        picks = _resolve_all(pool, service.call(state, system, user, "rerank", RANK_SCHEMA).get("picks", []), "rerank")
+        if not picks:
+            raise LLMUnavailable("the model returned no valid picks")
+        return [r.tmdb_id for r, _ in picks]
+
+    def explain(batch: list[Recommendation]) -> dict[int, str]:
+        system, user = explain_prompt(batch, liked, disliked)
+        answer = service.call(state, system, user, "explain", EXPLAIN_SCHEMA).get("explanations", [])
+        return {r.tmdb_id: why for r, p in _resolve_all(batch, answer, "explain")
+                if (why := str(p.get("why", "")).strip()[:300])}
+
+    errors: list[str] = []
     proposed: list[int] = []
-    moved = dropped = 0
-    for p in data.get("picks", []):
-        r, how = _resolve_pick(pool, p.get("n"), str(p.get("title", "")))
-        if r is None or r.tmdb_id in whys:
-            dropped += 1
-            continue
-        moved += how == "by_title"
-        proposed.append(r.tmdb_id)
-        whys[r.tmdb_id] = str(p.get("why", "")).strip()[:300]
-    if dropped or moved:
-        log.warning("llm rerank: %d picks dropped (unknown, mismatched or repeated), %d matched by title", dropped, moved)
-    if not proposed:
-        raise LLMUnavailable("the model returned no valid picks")
-    by_id = {r.tmdb_id: r for r in pool}
-    order = constrain_order([r.tmdb_id for r in pool], proposed, settings.llm_max_position_shift)
-    return [by_id[t] for t in order] + list(recs[len(pool):]), {t: w for t, w in whys.items() if w}
+    whys: dict[int, str] = {}
+    with ThreadPoolExecutor(max_workers=1 + len(batches)) as pool_exec:
+        rank_job = pool_exec.submit(rank)
+        explain_jobs = [pool_exec.submit(explain, b) for b in batches]
+        try:
+            proposed = rank_job.result()
+        except LLMUnavailable as exc:
+            errors.append(str(exc))
+        for job in explain_jobs:
+            try:
+                whys.update(job.result())
+            except LLMUnavailable as exc:
+                errors.append(str(exc))
+
+    items = list(recs)
+    if proposed:
+        by_id = {r.tmdb_id: r for r in pool}
+        order = constrain_order([r.tmdb_id for r in pool], proposed, settings.llm_max_position_shift)
+        items = [by_id[t] for t in order] + list(recs[len(pool):])
+    return RerankResult(items, whys, reordered=bool(proposed), message=errors[0] if errors else None)
 
 
 # ---------------------------------------------------------------- requests

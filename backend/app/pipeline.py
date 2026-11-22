@@ -22,6 +22,7 @@ from functools import lru_cache
 from typing import TypeVar
 
 import httpx
+import numpy as np
 from sqlalchemy import Engine
 from sqlmodel import Session, col, select
 
@@ -32,13 +33,13 @@ from app.collab import MFModel, TrainParams, load_scorer, train_als
 from app.config import Settings, get_settings
 from app.db import Movie, get_engine, purge_user_data, utcnow
 from app.embeddings import Embedder, OnnxEmbedder, build_document, doc_hash, l2_normalize
-from app.llm import LLMService, LLMUnavailable, OpenAIClient, ParsedRequest, RatedExample, template_why
+from app.llm import LLMService, OpenAIClient, ParsedRequest, RatedExample, template_why
 from app.llm import rerank as llm_rerank
 from app.library import Library
 from app.movielens import MovieLensError, download_dataset, is_downloaded, load_dataset
 from app.profile import TasteProfile, load_profile
 from app.omdb import OmdbClient, OmdbRatings
-from app.recommend import RecFilters, RecResult, recommend
+from app.recommend import Recommendation, RecFilters, RecResult, SimilarFilm, recommend
 from app.sessions import RunState, UserSession
 from app.taste import build_taste_model
 from app.tmdb import TmdbClient, fetch_movie
@@ -560,21 +561,48 @@ class Pipeline:
             query_weight=cfg.llm_query_weight,
             extra_ids=extra,
         )
+        if rerank:
+            result.items = result.items[: max(limit, cfg.llm_rerank_pool, cfg.llm_explain_count)]
+        else:
+            result.items = result.items[:limit]
+        self.add_similar_rated(lib, result.items)
         for r in result.items:
             r.why, r.why_source = template_why(r), "template"
         if rerank:
-            try:
-                liked, disliked = self.rated_examples(lib)
-                items, whys = llm_rerank(self.llm, lib.llm, result.items, liked, disliked, cfg)
-            except LLMUnavailable as exc:
-                result.llm_message = str(exc)
-            else:
-                for r in items:
-                    if r.tmdb_id in whys:
-                        r.why, r.why_source = whys[r.tmdb_id], "llm"
-                result.items, result.reranked = items, True
+            liked, disliked = self.rated_examples(lib)
+            out = llm_rerank(self.llm, lib.llm, result.items, liked, disliked, cfg)
+            for r in out.items:
+                if r.tmdb_id in out.whys:
+                    r.why, r.why_source = out.whys[r.tmdb_id], "llm"
+            result.items, result.reranked, result.llm_message = out.items, out.reordered, out.message
         result.items = result.items[:limit]
         return result, blend
+
+    def add_similar_rated(self, lib: Library, items: list[Recommendation]) -> None:
+        """For each film, the user's most similar highly rated films (by
+        embedding): the evidence its explanation cites."""
+        k = self.settings.similar_rated_count
+        if not items or k <= 0 or self.store is None:
+            return
+        ratings = lib.ratings()
+        if not ratings:
+            return
+        cutoff = min(4.0, sorted(ratings.values(), reverse=True)[max(0, len(ratings) // 4 - 1)])
+        liked = [t for t, r in ratings.items() if r >= cutoff]
+        emb = self.store.get_embeddings(set(liked) | {r.tmdb_id for r in items})
+        liked = [t for t in liked if t in emb]
+        if not liked:
+            return
+        names = {f.tmdb_id: f for f in lib.films.values() if f.tmdb_id is not None}
+        mat = np.stack([emb[t] for t in liked]).astype(np.float32)
+        for r in items:
+            if r.tmdb_id not in emb:
+                continue
+            sims = mat @ np.asarray(emb[r.tmdb_id], dtype=np.float32)
+            top = np.argsort(-sims)[:k]
+            r.similar_rated = [
+                SimilarFilm(names[liked[i]].name, names[liked[i]].year, ratings[liked[i]]) for i in top
+            ]
 
     def rated_examples(self, lib: Library) -> tuple[list[RatedExample], list[RatedExample]]:
         """The user's highest- and lowest-rated films, for the re-rank prompt."""
