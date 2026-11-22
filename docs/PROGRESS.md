@@ -2,7 +2,7 @@
 
 Tracks where the build stands against [SPEC.md](SPEC.md). Update this file at the end of every milestone.
 
-_Last updated: 2026-09-25_
+_Last updated: 2026-11-22_
 
 ## Status
 
@@ -85,6 +85,7 @@ These are deliberate, so don't "fix" them back without reason.
 
 27. **A built-in sample profile for visitors without an export** (`app/demo.py`). Most people who follow a shared link (recruiters, friends without Letterboxd) have no export to upload. The demo is a made-up viewer (arthouse/international and cerebral sci-fi high, franchise blockbusters low) with 68 ratings, above `BLEND_MIN_RATINGS_FOR_LEARNING`, so the learned blend and the metrics page show real content. Titles were picked to be unambiguous: all 74 match TMDB with no review. It goes through the same path as an upload (parse, caps, queue), and the browser's saved fixes aren't applied to it. It has its own per-IP limit (`DEMO_SESSIONS_PER_IP_PER_HOUR`, 60) instead of sharing the upload limit (10): a cached demo run costs no API calls or embedding, visitors from one office share an IP, and sharing the limit locked out the demo after a few test clicks. Cost: the first demo on a cold film cache took 202 s locally (TMDB fetches + embedding ~1,300 films); after that a demo session takes ~1 s. So warm it before sharing the link: run the demo once against local `backend/data` and `make fly-push-data`, or click it once on the server after a deploy. Keep the "68 rated films" caption in `UploadPage.tsx` in sync with `demo.RATED`.
 28. **One session per browser; repeat demo clicks are free.** A new upload or demo drops the caller's previous session (`X-Session-Id`), and `POST /api/sessions/demo` returns the caller's existing demo session (unless it failed) without counting toward the rate limit. The Fly machine suspends when idle, so the first click can wait seconds for it to wake; the button now shows a spinner and, after 1.5 s, "Waking up the server…", and a ref guards against double submits. Before this, every click made a new session (towards `MAX_SESSIONS`, 20) and used up the demo limit, with only a dimmed button as feedback.
+29. **Your own reviews don't help score ② (tried and removed).** Each review of a film rated ≥ 4★ (≥ 40 chars) was embedded in memory with the BGE query prefix and added as a score ② vector, its positive z-score scaled by a weight before the max. Holdout folds only used reviews of their training films. On three real exports, one user has no reviews. For user A, using 18 reviews, ②'s Spearman went from 0.028 to −0.03…0.00, the learned blend from 0.627 to 0.628–0.631, and the ranking from 0.524 to 0.518–0.530. For user B, using 83 reviews, ② went from 0.096 to 0.062–0.074 and the blend from 0.476 to 0.474–0.475, at weights 0.6, 0.8 and 1.0. Like ② itself (see the learned-blend note under open items), review similarity says more about *what* you watch than how you rate it. Revisit only with a different signal, e.g. M7's review-aspect extraction feeding score ①.
 
 ## Open items / known issues
 
@@ -102,7 +103,7 @@ These are deliberate, so don't "fix" them back without reason.
 ## Plan for remaining milestones
 
 ### M6: Blending, OMDb, MMR, metrics
-_Done: everything below except the review-query idea, which is still open (keep it only if it beats the metrics above)._
+_Done. The review-query idea was tried and rejected (decision 29)._
 - Add `/discover/movie` as another candidate source. Also consider score ③ as a source: the top predicted MovieLens films you haven't seen (they need TMDB enrichment and embedding like any candidate).
 - Holdout for ③ is cheap: fold the user in on the 80% (decision 13), no retraining.
 - OMDb only for the final shortlist, via the IMDb id from `external_ids`. `CachedHttpClient` already supports `daily_limit=1000`.
