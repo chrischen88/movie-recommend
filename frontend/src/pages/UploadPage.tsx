@@ -3,6 +3,9 @@ import { Link } from "react-router-dom";
 import { api, clearSavedFixes, hasSession, savedFixes, type RunOut, type UploadResult } from "../api";
 
 const POLL_MS = 800;
+// After this long without a reply, say the server is probably waking up (it
+// suspends when idle) so the click doesn't look like it did nothing.
+const SLOW_START_MS = 1500;
 
 const STAGE_LABELS: Record<string, string> = {
   parsing: "Parsing export",
@@ -18,7 +21,11 @@ const STAGE_LABELS: Record<string, string> = {
 
 export default function UploadPage() {
   const [dragging, setDragging] = useState(false);
-  const [uploading, setUploading] = useState(false);
+  const [starting, setStarting] = useState<"upload" | "demo" | null>(null);
+  const [slowStart, setSlowStart] = useState(false);
+  const startingRef = useRef(false);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const scrollToPanel = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [upload, setUpload] = useState<UploadResult | null>(null);
   const [runOut, setRunOut] = useState<RunOut | null>(null);
@@ -47,20 +54,37 @@ export default function UploadPage() {
     };
   }, [poll]);
 
-  const start = async (begin: () => Promise<UploadResult>) => {
-    setUploading(true);
+  const start = async (kind: "upload" | "demo", begin: () => Promise<UploadResult>) => {
+    // A ref, not state: two quick clicks both run before React re-renders.
+    if (startingRef.current) return;
+    startingRef.current = true;
+    setStarting(kind);
+    setSlowStart(false);
     setError(null);
     setUpload(null);
+    const slow = window.setTimeout(() => setSlowStart(true), SLOW_START_MS);
     try {
       const result = await begin();
       setUpload(result);
+      scrollToPanel.current = true;
       poll();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setUploading(false);
+      window.clearTimeout(slow);
+      startingRef.current = false;
+      setStarting(null);
+      setSlowStart(false);
     }
   };
+
+  // Bring the progress panel into view once a new run starts (on phones it's below the fold).
+  useEffect(() => {
+    if (runOut && scrollToPanel.current) {
+      scrollToPanel.current = false;
+      panelRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [runOut]);
 
   const resume = async () => {
     setError(null);
@@ -93,9 +117,10 @@ export default function UploadPage() {
     e.preventDefault();
     setDragging(false);
     const file = e.dataTransfer.files[0];
-    if (file) void start(() => api.upload(file));
+    if (file) void start("upload", () => api.upload(file));
   };
 
+  const uploading = starting !== null;
   const running = runOut !== null && isActive(runOut);
 
   return (
@@ -134,24 +159,34 @@ export default function UploadPage() {
           disabled={running || uploading}
           onChange={(e) => {
             const file = e.target.files?.[0];
-            if (file) void start(() => api.upload(file));
+            if (file) void start("upload", () => api.upload(file));
           }}
         />
         <span className="text-zinc-300">
-          {uploading ? "Uploading…" : running ? "Processing…" : "Drag & drop ZIP, or click to choose"}
+          {starting === "upload" ? "Uploading…" : running ? "Processing…" : "Drag & drop ZIP, or click to choose"}
         </span>
       </label>
 
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
         <button
-          onClick={() => void start(api.demo)}
+          onClick={() => void start("demo", api.demo)}
           disabled={running || uploading}
-          className="rounded-md border border-zinc-700 px-3 py-1.5 text-zinc-200 hover:border-zinc-500 hover:text-white disabled:opacity-50"
+          aria-busy={starting === "demo"}
+          className={`inline-flex items-center gap-2 rounded-md border px-3 py-1.5 ${
+            starting === "demo"
+              ? "cursor-wait border-sky-700 bg-sky-950/40 text-sky-200"
+              : "border-zinc-700 text-zinc-200 hover:border-zinc-500 hover:text-white disabled:opacity-50"
+          }`}
         >
-          Try it with a sample profile
+          {starting === "demo" && (
+            <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-sky-300 border-t-transparent" />
+          )}
+          {starting === "demo" ? "Starting the sample profile…" : "Try it with a sample profile"}
         </button>
-        <span className="text-zinc-500">
-          No export? See recommendations for a made-up viewer with 68 rated films.
+        <span className="text-zinc-500" aria-live="polite">
+          {slowStart && starting === "demo"
+            ? "Waking up the server, this can take a few seconds…"
+            : "No export? See recommendations for a made-up viewer with 68 rated films."}
         </span>
       </div>
 
@@ -159,7 +194,11 @@ export default function UploadPage() {
         <div className="rounded-md bg-red-950/50 border border-red-800 p-3 text-red-300">{error}</div>
       )}
 
-      {runOut && <RunPanel out={runOut} onResume={resume} />}
+      {runOut && (
+        <div ref={panelRef}>
+          <RunPanel out={runOut} onResume={resume} />
+        </div>
+      )}
 
       {(runOut || fixCount > 0) && (
         <div className="flex flex-wrap gap-4 text-sm">

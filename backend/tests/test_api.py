@@ -435,3 +435,29 @@ def test_demo_sessions_have_their_own_rate_limit(client: TestClient, sample_zip:
     # Demos don't count toward the upload limit either way.
     settings.uploads_per_ip_per_hour = 2
     upload(client, sample_zip)
+
+
+def test_repeat_demo_clicks_reuse_the_session(client: TestClient) -> None:
+    settings = store_of().settings
+    settings.demo_sessions_per_ip_per_hour = 1
+    first = client.post("/api/sessions/demo").json()
+    client.headers["X-Session-Id"] = first["session_id"]
+    # Clicking again (e.g. while the server wakes up) returns the same session
+    # and doesn't use up the limit.
+    for _ in range(3):
+        again = client.post("/api/sessions/demo")
+        assert again.status_code == 200, again.text
+        assert again.json()["session_id"] == first["session_id"]
+        assert again.json()["stats"] == first["stats"]
+    assert len(store_of()) == 1
+
+
+def test_new_session_replaces_the_callers_previous_one(client: TestClient, sample_zip: bytes) -> None:
+    old = upload(client, sample_zip)["session_id"]
+    demo_id = client.post("/api/sessions/demo").json()["session_id"]
+    assert demo_id != old
+    assert store_of().get(old) is None
+    client.headers["X-Session-Id"] = demo_id
+    new = upload(client, sample_zip)["session_id"]
+    assert store_of().get(demo_id) is None and store_of().get(new) is not None
+    assert len(store_of()) == 1

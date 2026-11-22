@@ -69,6 +69,9 @@ class UserSession:
     run: RunState
     last_seen: float
     upload: dict[str, Any]  # what parsing found (counts, warnings), kept for each run's stats
+    files_found: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    demo: bool = False  # on the built-in sample profile (app/demo.py)
 
 
 class InlineExecutor(Executor):
@@ -101,7 +104,15 @@ class SessionStore:
 
     # ------------------------------------------------------------ sessions
 
-    def create(self, library: Library, upload: dict[str, Any]) -> UserSession:
+    def create(
+        self,
+        library: Library,
+        upload: dict[str, Any],
+        *,
+        files_found: list[str] | None = None,
+        warnings: list[str] | None = None,
+        demo: bool = False,
+    ) -> UserSession:
         with self._lock:
             self._sweep()
             if len(self._sessions) >= self.settings.max_sessions:
@@ -112,6 +123,9 @@ class SessionStore:
                 run=RunState(stats=dict(upload)),
                 last_seen=self._clock(),
                 upload=upload,
+                files_found=list(files_found or []),
+                warnings=list(warnings or []),
+                demo=demo,
             )
             self._sessions[session.id] = session
             return session

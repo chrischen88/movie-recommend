@@ -144,9 +144,11 @@ async def create_session(
     store: StoreDep,
     pipeline: PipelineDep,
     fixes: Annotated[str, Form()] = "{}",
+    x_session_id: Annotated[str | None, Header()] = None,
 ) -> dict[str, object]:
     """Parse an export into a new in-memory session and queue its processing.
-    `fixes` is the browser's saved match fixes (see library_from_export)."""
+    `fixes` is the browser's saved match fixes (see library_from_export). The
+    caller's previous session, if any, is replaced."""
     settings = store.settings
     _check_upload_rate(request, store)
     data = await file.read(settings.max_upload_bytes + 1)
@@ -158,16 +160,28 @@ async def create_session(
         fix_map = None
     if not isinstance(fix_map, dict):
         raise HTTPException(400, "fixes must be a JSON object")
-    return await _start_session(data, fix_map, store, pipeline)
+    return await _start_session(data, fix_map, store, pipeline, replaces=x_session_id)
 
 
 @app.post("/api/sessions/demo")
-async def create_demo_session(request: Request, store: StoreDep, pipeline: PipelineDep) -> dict[str, object]:
+async def create_demo_session(
+    request: Request,
+    store: StoreDep,
+    pipeline: PipelineDep,
+    x_session_id: Annotated[str | None, Header()] = None,
+) -> dict[str, object]:
     """A session on the built-in sample profile (app/demo.py), for visitors
     without an export. The browser's saved fixes belong to their own export, so
-    they aren't applied here."""
+    they aren't applied here.
+
+    Idempotent per browser: if the caller already has a demo session that hasn't
+    failed, that one is returned (its run keeps going) without counting toward
+    the rate limit, so repeated clicks while the server wakes up are harmless."""
+    existing = store.get(x_session_id)
+    if existing is not None and existing.demo and existing.run.status not in ("error", "cancelled"):
+        return _session_reply(store, existing)
     _check_upload_rate(request, store, demo=True)
-    return await _start_session(demo_export_zip(), {}, store, pipeline)
+    return await _start_session(demo_export_zip(), {}, store, pipeline, demo=True, replaces=x_session_id)
 
 
 def _check_upload_rate(request: Request, store: SessionStore, *, demo: bool = False) -> None:
@@ -178,8 +192,17 @@ def _check_upload_rate(request: Request, store: SessionStore, *, demo: bool = Fa
 
 
 async def _start_session(
-    data: bytes, fix_map: dict[str, Any], store: SessionStore, pipeline: Pipeline
+    data: bytes,
+    fix_map: dict[str, Any],
+    store: SessionStore,
+    pipeline: Pipeline,
+    *,
+    demo: bool = False,
+    replaces: str | None = None,
 ) -> dict[str, object]:
+    """Parse `data` into a new session and queue its run. `replaces` is the
+    caller's previous session id: it's dropped once the new one is queued, so a
+    browser holds one session at a time."""
     settings = store.settings
     try:
         export = await run_in_threadpool(parse_export, data, max_csv_bytes=settings.max_uncompressed_csv_bytes)
@@ -202,7 +225,9 @@ async def _start_session(
         "fixes_applied": applied_fixes(lib),
     }
     try:
-        session = store.create(lib, upload)
+        session = store.create(
+            lib, upload, files_found=export.files_found, warnings=export.warnings, demo=demo
+        )
     except Busy as exc:
         raise HTTPException(503, str(exc)) from exc
     try:
@@ -210,12 +235,18 @@ async def _start_session(
     except Busy as exc:
         store.delete(session.id)
         raise HTTPException(503, str(exc)) from exc
+    if replaces and replaces != session.id:
+        store.delete(replaces)
+    return _session_reply(store, session)
+
+
+def _session_reply(store: SessionStore, session: UserSession) -> dict[str, object]:
     return {
         "session_id": session.id,
         "expires_in": store.expires_in(session),
-        "files_found": export.files_found,
-        "stats": upload,
-        "warnings": export.warnings,
+        "files_found": session.files_found,
+        "stats": session.upload,
+        "warnings": session.warnings,
     }
 
 
