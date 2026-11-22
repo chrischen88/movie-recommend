@@ -98,6 +98,11 @@ export interface Recommendation {
   imdb_rating: number | null;
   rt_score: number | null;
   metacritic: number | null;
+  /** One-sentence explanation; "llm" when written by the AI, "template" otherwise. */
+  why?: string | null;
+  why_source?: "llm" | "template" | null;
+  /** 0-1 percentile match to the typed request; only when one was given. */
+  query_match?: number | null;
 }
 
 /** One feature behind score ①, e.g. "Director Denis Villeneuve", +0.9★ over 4 films. */
@@ -116,6 +121,26 @@ export interface Facets {
   languages: Record<string, number>;
 }
 
+export interface LlmStatus {
+  available: boolean;
+  reranked: boolean;
+  /** Why the AI wasn't used when it was asked for. */
+  message: string | null;
+}
+
+/** How the typed request was interpreted. */
+export interface RequestInterpretation {
+  query: string;
+  genres: string[];
+  decade: number | null;
+  max_runtime: number | null;
+  language: string | null;
+  keywords: string[];
+  /** false: the AI wasn't used and the raw text was searched directly. */
+  by_llm: boolean;
+  note: string | null;
+}
+
 export interface RecommendationsResponse {
   ready: boolean;
   message: string | null;
@@ -126,6 +151,8 @@ export interface RecommendationsResponse {
   /** Your rated films found in MovieLens; null when there's no collaborative score. */
   collab_films?: number | null;
   blend_mode?: "learned" | "fixed";
+  llm?: LlmStatus;
+  request?: RequestInterpretation | null;
 }
 
 export type RatingSource = "tmdb" | "imdb" | "rt" | "metacritic";
@@ -138,6 +165,22 @@ export interface RecFilters {
   decade?: number;
   max_runtime?: number;
   language?: string;
+}
+
+export interface LlmUsage {
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_usd: number;
+}
+
+export interface LlmMetrics {
+  enabled: boolean;
+  model: string | null;
+  daily_call_limit: number;
+  today: LlmUsage;
+  all_time: LlmUsage;
+  session: LlmUsage & { limit: number };
 }
 
 export interface MethodMetrics {
@@ -171,6 +214,7 @@ export interface MetricsResponse {
   collab_model?: { dataset: string; val_rmse: number; val_rmse_global_mean: number; n_users: number; n_items: number } | null;
   omdb?: { enabled: boolean; used_today: number; daily_limit: number };
   candidates?: { total: number; by_source: Record<string, number> };
+  llm?: LlmMetrics;
 }
 
 export interface TasteCluster {
@@ -339,13 +383,19 @@ export const api = {
     ),
   ignoreMatch: (film_key: string) =>
     saving(postJson<MatchRow>("/api/matches/ignore", { film_key }), () => ({ ignored: true })),
-  recommendations: (limit = 60, filters: RecFilters = {}) => {
+  recommendations: (
+    limit = 60,
+    filters: RecFilters = {},
+    opts: { q?: string; rerank?: boolean; signal?: AbortSignal } = {},
+  ) => {
     const qs = new URLSearchParams({ limit: String(limit) });
+    if (opts.q) qs.set("q", opts.q);
+    if (opts.rerank) qs.set("rerank", "true");
     for (const [k, v] of Object.entries(filters)) {
       if (v !== undefined && v !== "") qs.set(k, String(v));
     }
     return withSession<RecommendationsResponse>(
-      () => request<RecommendationsResponse>(`/api/recommendations?${qs}`),
+      () => request<RecommendationsResponse>(`/api/recommendations?${qs}`, { signal: opts.signal }),
       () => ({ ready: false, message: noSessionMessage(), items: [] }),
     );
   },

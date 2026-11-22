@@ -133,7 +133,9 @@ export default function UploadPage() {
         <p className="text-zinc-500 text-xs mt-2">
           Your export is processed in memory and deleted after an hour without use, or when you click
           "Forget my data now". Nothing about you is saved on the server. Match fixes you make are kept in
-          this browser only, and applied to your next upload.
+          this browser only, and applied to your next upload. When AI features are on, the titles and ratings of your highest- and
+          lowest-rated films, and any request you type, are sent to OpenAI to pick and explain
+          recommendations; this app doesn't store them.
         </p>
       </div>
 

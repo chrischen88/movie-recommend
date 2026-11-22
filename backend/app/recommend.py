@@ -55,6 +55,9 @@ class Recommendation:
     imdb_rating: float | None = None
     rt_score: int | None = None
     metacritic: int | None = None
+    why: str | None = None  # one-sentence explanation (app/llm.py)
+    why_source: str | None = None  # "llm" | "template"
+    query_match: float | None = None  # percentile match to a natural-language request, 0–1
 
 
 @dataclass(frozen=True)
@@ -128,6 +131,8 @@ class RecResult:
     matching: int  # candidates passing the filters
     facets: Facets
     collab_films: int | None = None  # your rated films found in MovieLens; None = no score ③
+    reranked: bool = False  # the LLM re-ordered and explained the top picks
+    llm_message: str | None = None  # why it didn't, when it was asked to
 
 
 def facets_for(recs: list[Recommendation]) -> Facets:
@@ -161,17 +166,25 @@ def recommend(
     mmr_lambda: float | None = None,
     min_runtime: int = 0,
     fit_weight: float = 0.0,
+    query_vector: np.ndarray | None = None,
+    query_weight: float = 0.5,
+    extra_ids: set[int] | None = None,
 ) -> RecResult:
     """`blend=None` averages the available scores equally. `mmr_lambda=None`
     skips MMR re-ranking. Films shorter than `min_runtime` minutes are left out
     unless they're on the watchlist. In learned mode, `fit_weight` mixes taste
-    fit into the ranking (`blend.rank_with_fit`)."""
+    fit into the ranking (`blend.rank_with_fit`).
+
+    With a `query_vector` (a natural-language request), the ranking becomes
+    (1 − query_weight)·ranking + query_weight·(match to the request), both as
+    percentiles, and `extra_ids` (films from the shared index near the request,
+    which the user hasn't seen) join the pool."""
     filters = filters or RecFilters()
     # Every unseen film in the library or candidate set is scored: a few hundred
     # to a few thousand dot products, so no nearest-neighbour cutoff. (A k-NN
     # prefilter would drop films that ① or ③ rate highly just because ② doesn't.)
     # The index is shared by every user, so the pool comes from the library.
-    pool = lib.eligible_ids()
+    pool = lib.eligible_ids() | ((extra_ids or set()) - lib.own_ids())
     embeddings = store.get_embeddings(pool)
     if len(embeddings) < len(pool):
         log.info("%d eligible films aren't embedded yet and are skipped", len(pool) - len(embeddings))
@@ -227,7 +240,9 @@ def recommend(
                 similarity=sc.raw,
                 source=sc.source,
                 source_label=model.label_for(sc.source),
-                candidate_sources=provenance.get(tid, ["watchlist"] if tid in watchlist else []),
+                candidate_sources=provenance.get(
+                    tid, ["watchlist"] if tid in watchlist else ["request"] if tid in (extra_ids or ()) else []
+                ),
                 profile_score=None if ps is None else ps.normalized,
                 profile_raw=None if ps is None else ps.raw,
                 profile_reasons=[] if ps is None else ps.contributions,
@@ -241,6 +256,12 @@ def recommend(
         )
     learned = blend.mode == "learned"
     ranking = rank_with_fit(np.array(values), np.array(fits), fit_weight if learned else 0.0)
+    if query_vector is not None and recs:
+        q = np.asarray(query_vector, dtype=np.float32)
+        match = percentile_rank(np.array([float(embeddings[r.tmdb_id] @ q) for r in recs]))
+        ranking = percentile_rank((1 - query_weight) * ranking + query_weight * match)
+        for r, m in zip(recs, match):
+            r.query_match = float(m)
     for r, pct in zip(recs, ranking):
         r.score = min(1.0, float(pct) + (watchlist_boost if r.in_watchlist else 0.0))
 

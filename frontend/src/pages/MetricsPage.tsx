@@ -147,6 +147,27 @@ export default function MetricsPage() {
         </Section>
       )}
 
+      {data.llm && (
+        <Section title="AI (OpenAI)">
+          {data.llm.enabled ? (
+            <dl className="space-y-1 text-sm">
+              <Row label="Model" value={data.llm.model ?? "unknown"} />
+              <Row
+                label="This session"
+                value={`${data.llm.session.calls} of ${data.llm.session.limit} calls · ${usd(data.llm.session.cost_usd)}`}
+              />
+              <Row
+                label="Today (all users)"
+                value={`${data.llm.today.calls.toLocaleString()} of ${data.llm.daily_call_limit.toLocaleString()} calls · ${usd(data.llm.today.cost_usd)}`}
+              />
+              <Row label="All-time cost" value={usd(data.llm.all_time.cost_usd)} />
+            </dl>
+          ) : (
+            <p className="text-sm text-zinc-400">AI features are off because no OPENAI_API_KEY is set.</p>
+          )}
+        </Section>
+      )}
+
       <div className="grid gap-8 sm:grid-cols-2">
         <Section title="Candidates">
           <p className="text-sm text-zinc-300">{data.candidates?.total.toLocaleString()} unseen films are scored.</p>
@@ -192,6 +213,8 @@ export default function MetricsPage() {
     </div>
   );
 }
+
+const usd = (n: number) => `$${n.toFixed(4)}`;
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (

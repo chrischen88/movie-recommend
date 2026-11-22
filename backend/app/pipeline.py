@@ -31,7 +31,9 @@ from app.cache import ApiError, DailyBudgetExceeded, ResponseCache
 from app.collab import MFModel, TrainParams, load_scorer, train_als
 from app.config import Settings, get_settings
 from app.db import Movie, get_engine, purge_user_data, utcnow
-from app.embeddings import Embedder, OnnxEmbedder, build_document, doc_hash
+from app.embeddings import Embedder, OnnxEmbedder, build_document, doc_hash, l2_normalize
+from app.llm import LLMService, LLMUnavailable, OpenAIClient, ParsedRequest, RatedExample, template_why
+from app.llm import rerank as llm_rerank
 from app.library import Library
 from app.movielens import MovieLensError, download_dataset, is_downloaded, load_dataset
 from app.profile import TasteProfile, load_profile
@@ -80,6 +82,7 @@ class Pipeline:
         max_workers: int = 8,
         movielens_transport: httpx.BaseTransport | None = None,
         omdb: OmdbClient | None = None,
+        llm: LLMService | None = None,
     ) -> None:
         self.engine = engine
         self.settings = settings
@@ -89,6 +92,7 @@ class Pipeline:
         self.max_workers = max_workers
         self.movielens_transport = movielens_transport  # tests inject a fake
         self.omdb = omdb
+        self.llm = llm or LLMService(None, engine, settings)
 
     # ------------------------------------------------------------ run control
 
@@ -505,20 +509,40 @@ class Pipeline:
         }
 
     def recommend(
-        self, lib: Library, session: Session, *, limit: int, filters: RecFilters | None = None, mmr: bool = True
+        self,
+        lib: Library,
+        session: Session,
+        *,
+        limit: int,
+        filters: RecFilters | None = None,
+        mmr: bool = True,
+        request: ParsedRequest | None = None,
+        rerank: bool = False,
     ) -> tuple[RecResult, BlendModel] | None:
         """Everything the recommendation list needs, wired from settings. None
-        until the library has a taste model and there's a vector store."""
+        until the library has a taste model and there's a vector store.
+
+        `request` (a parsed natural-language request) pulls the ranking toward
+        its query; `rerank` lets the LLM re-order and explain the top picks.
+        Every film gets a template explanation, replaced by the LLM's when it
+        gives one."""
         if lib.taste is None or self.store is None:
             return None
         cfg = self.settings
         blend = lib.blend or fixed_model(cfg)
+        query_vector, extra = None, None
+        if request is not None and request.query and self.embedder is not None:
+            query_vector = self.embedder.embed_query(request.query)
+            w = cfg.llm_query_weight
+            search = l2_normalize(w * query_vector + (1 - w) * lib.taste.taste_vector)
+            extra = {t for t, _ in self.store.query(search, cfg.llm_query_extra_candidates)}
+        want = max(limit, cfg.llm_rerank_pool) if rerank else limit
         result = recommend(
             session,
             self.store,
             lib,
             lib.taste,
-            limit=limit,
+            limit=want,
             mode=cfg.embedding_score_mode,
             filters=filters,
             profile=load_profile(session, lib.ratings(), cfg.shrinkage_k),
@@ -532,8 +556,37 @@ class Pipeline:
             mmr_lambda=cfg.mmr_lambda if mmr else None,
             min_runtime=cfg.recommend_min_runtime,
             fit_weight=cfg.rank_fit_weight,
+            query_vector=query_vector,
+            query_weight=cfg.llm_query_weight,
+            extra_ids=extra,
         )
+        for r in result.items:
+            r.why, r.why_source = template_why(r), "template"
+        if rerank:
+            try:
+                liked, disliked = self.rated_examples(lib)
+                items, whys = llm_rerank(self.llm, lib.llm, result.items, liked, disliked, cfg)
+            except LLMUnavailable as exc:
+                result.llm_message = str(exc)
+            else:
+                for r in items:
+                    if r.tmdb_id in whys:
+                        r.why, r.why_source = whys[r.tmdb_id], "llm"
+                result.items, result.reranked = items, True
+        result.items = result.items[:limit]
         return result, blend
+
+    def rated_examples(self, lib: Library) -> tuple[list[RatedExample], list[RatedExample]]:
+        """The user's highest- and lowest-rated films, for the re-rank prompt."""
+        rated = sorted(
+            {f.tmdb_id: f for f in lib.films.values() if f.tmdb_id is not None and f.rating is not None}.values(),
+            key=lambda f: (-(f.rating or 0), f.name),
+        )
+        cfg = self.settings
+        ex = [RatedExample(f.name, f.year, f.rating or 0) for f in rated]
+        liked = ex[: cfg.llm_liked_examples]
+        disliked = [e for e in reversed(ex[len(liked):])][: cfg.llm_disliked_examples]
+        return liked, disliked
 
     def fetch_omdb(self, lib: Library, run: RunState | None = None) -> dict[str, object]:
         """IMDb / Rotten Tomatoes / Metacritic for the library's top
@@ -703,4 +756,10 @@ def get_pipeline() -> Pipeline:
         omdb=make_omdb_client(settings, cache),
         embedder=OnnxEmbedder(settings.embedding_model, settings.embedding_model_batch_size),
         store=ChromaStore(settings.chroma_path, settings.vector_collection),
+        llm=LLMService(
+            OpenAIClient(settings.openai_api_key, settings.openai_model, settings.llm_timeout_seconds)
+            if settings.openai_api_key else None,
+            engine,
+            settings,
+        ),
     )

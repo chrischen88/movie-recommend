@@ -16,6 +16,7 @@ dependencies = [
     "tokenizers>=0.15",
     "huggingface-hub>=0.20",
     "chromadb>=1.0",
+    "openai>=1.40",
 ]
 
 [project.optional-dependencies]

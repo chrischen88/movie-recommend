@@ -377,7 +377,8 @@ def test_nothing_about_the_user_is_stored(client: TestClient, engine: Engine, sa
     client.post("/api/session/reprocess")
     client.delete("/api/session")
 
-    assert set(inspect(engine).get_table_names()) == {"apicache", "movie"}
+    # llmusage holds daily call and token counts only (app/llm.py).
+    assert set(inspect(engine).get_table_names()) == {"apicache", "movie", "llmusage"}
     # data_dir is tmp_path: only the shared film database is on disk, no model files.
     stored = {p.name for p in tmp_path.rglob("*") if p.is_file()}
     assert stored <= {"test.sqlite3", "test.sqlite3-wal", "test.sqlite3-shm"}
@@ -461,3 +462,68 @@ def test_new_session_replaces_the_callers_previous_one(client: TestClient, sampl
     new = upload(client, sample_zip)["session_id"]
     assert store_of().get(demo_id) is None and store_of().get(new) is not None
     assert len(store_of()) == 1
+
+
+def with_llm(client: TestClient, llm: object | None) -> None:
+    from app.llm import LLMService
+
+    pipeline = app.dependency_overrides[get_pipeline]()
+    pipeline.llm = LLMService(llm, pipeline.engine, pipeline.settings)  # type: ignore[arg-type]
+
+
+def test_recommendations_without_llm_get_template_explanations(client: TestClient, sample_zip: bytes) -> None:
+    upload(client, sample_zip)
+    body = client.get("/api/recommendations", params={"rerank": True}).json()
+    assert body["llm"] == {"available": False, "reranked": False, "message": None}
+    assert body["items"] and all(r["why"] and r["why_source"] == "template" for r in body["items"])
+
+
+def test_llm_rerank_reorders_and_explains(client: TestClient, sample_zip: bytes) -> None:
+    from tests.fake_llm import FakeLLM
+
+    upload(client, sample_zip)
+    plain = client.get("/api/recommendations", params={"limit": 3}).json()["items"]
+    llm = FakeLLM()
+    with_llm(client, llm)
+    body = client.get("/api/recommendations", params={"limit": 3, "rerank": True}).json()
+    assert body["llm"]["reranked"] is True
+    ids = [r["tmdb_id"] for r in body["items"]]
+    assert len(ids) == 3 and ids != [r["tmdb_id"] for r in plain]
+    assert all(r["why_source"] == "llm" and r["why"] == f"Because of film {r['tmdb_id']}." for r in body["items"])
+    # Same list again: answered from the session's cache.
+    client.get("/api/recommendations", params={"limit": 3, "rerank": True})
+    assert len(llm.calls) == 1
+    usage = client.get("/api/metrics").json()["llm"]
+    assert usage["enabled"] and usage["session"]["calls"] == 1 and usage["all_time"]["prompt_tokens"] == 1000
+
+
+def test_llm_failure_keeps_the_blended_order(client: TestClient, sample_zip: bytes) -> None:
+    from tests.fake_llm import FakeLLM
+
+    upload(client, sample_zip)
+    plain = [r["tmdb_id"] for r in client.get("/api/recommendations").json()["items"]]
+    with_llm(client, FakeLLM(fail=True))
+    body = client.get("/api/recommendations", params={"rerank": True}).json()
+    assert [r["tmdb_id"] for r in body["items"]] == plain
+    assert body["llm"]["reranked"] is False and "failed" in body["llm"]["message"]
+    assert all(r["why_source"] == "template" for r in body["items"])
+
+
+def test_natural_language_request(client: TestClient, sample_zip: bytes) -> None:
+    from tests.fake_llm import FakeLLM
+
+    upload(client, sample_zip)
+    # Without a key the raw text is the query; nothing is filtered.
+    body = client.get("/api/recommendations", params={"q": "space"}).json()
+    assert body["request"]["by_llm"] is False and body["request"]["query"] == "space"
+    assert body["items"] and all(r["query_match"] is not None for r in body["items"])
+    with_llm(client, FakeLLM(request_answer={
+        "genres": ["Drama"], "decade": None, "max_runtime": None, "language": None,
+        "mood_keywords": [], "query": "quiet drama",
+    }))
+    body = client.get("/api/recommendations", params={"q": "something quiet"}).json()
+    assert body["request"]["by_llm"] is True and body["request"]["genres"] == ["Drama"]
+    assert body["items"] and all("Drama" in r["genres"] for r in body["items"])
+    # A filter set in the UI wins over the request's.
+    body = client.get("/api/recommendations", params={"q": "something quiet", "genre": "Comedy"}).json()
+    assert all("Comedy" in r["genres"] for r in body["items"])

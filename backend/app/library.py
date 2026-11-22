@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from app import matching
+from app.llm import LLMSessionState
 from app.letterboxd import LetterboxdExport, ParsedFilm
 
 if TYPE_CHECKING:
@@ -40,6 +41,7 @@ class Library:
     candidates: dict[int, list[str]] = field(default_factory=dict)
     taste: TasteModel | None = None
     blend: BlendModel | None = None
+    llm: LLMSessionState = field(default_factory=LLMSessionState)  # cache + usage, in memory
 
     # ------------------------------------------------------------ views
 

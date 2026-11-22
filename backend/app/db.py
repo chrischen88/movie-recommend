@@ -36,6 +36,16 @@ class ApiCache(SQLModel, table=True):
     expires_at: datetime | None = Field(default=None, index=True)
 
 
+class LlmUsage(SQLModel, table=True):
+    """LLM calls and tokens per UTC day and model: counts only, nothing a user sent."""
+
+    day: str = Field(primary_key=True)  # YYYY-MM-DD
+    model: str = Field(primary_key=True)
+    calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
 class Movie(SQLModel, table=True):
     """TMDB metadata for every film looked up so far, shared by all users."""
 

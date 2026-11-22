@@ -330,7 +330,8 @@ def test_purge_user_data(engine: Engine, tmp_path: Path) -> None:
 
     removed = p.purge_user_data()
     assert set(LEGACY_USER_TABLES) | set(LEGACY_USER_FILES) <= set(removed)
-    assert set(inspect(engine).get_table_names()) == {"apicache", "movie"}
+    # llmusage holds daily call and token counts only (app/llm.py).
+    assert set(inspect(engine).get_table_names()) == {"apicache", "movie", "llmusage"}
     assert not any((p.settings.data_dir / name).exists() for name in LEGACY_USER_FILES)
     assert store.get_metadata() == {1: {"tmdb_id": 1}, 2: {"tmdb_id": 2}}
     assert p.purge_user_data() == []  # idempotent

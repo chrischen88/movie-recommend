@@ -33,6 +33,7 @@ from app.db import Movie, get_session, utcnow
 from app.demo import demo_export_zip
 from app.letterboxd import ExportError, parse_export
 from app.library import InvalidFixes, Library, LibraryFilm, applied_fixes, library_from_export
+from app.llm import TMDB_GENRES, parse_request
 from app.pipeline import STAGES, Pipeline, TmdbUnavailable, get_pipeline
 from app.recommend import RatingSource, RecFilters
 from app.sessions import AlreadyQueued, Busy, RateLimited, SessionStore, UserSession, get_session_store
@@ -410,7 +411,15 @@ def get_recommendations(
     decade: Annotated[int | None, Query(ge=1870, le=2100)] = None,
     max_runtime: Annotated[int | None, Query(gt=0)] = None,
     language: str | None = None,
+    q: Annotated[str | None, Query(max_length=300)] = None,
+    rerank: bool = False,
 ) -> dict[str, Any]:
+    """`q` is a natural-language request ("a 90-minute thriller for tonight"):
+    the LLM turns it into filters (each used only where the matching filter
+    above isn't set) and a query that pulls the ranking toward it. `rerank`
+    lets the LLM re-order and explain the top picks. Both work without an
+    OpenAI key: the raw request becomes the query, and the blended order and
+    template explanations are kept."""
     lib = session.library
     reason = _not_ready(lib, pipeline)
     if reason:
@@ -418,18 +427,24 @@ def get_recommendations(
     if min_rating is not None and rating_source in ("tmdb", "imdb") and min_rating > 10:
         raise HTTPException(422, f"{rating_source} ratings are 0–10")
     cfg = pipeline.settings
+    request, request_note = None, None
+    if q and q.strip():
+        request, request_note = parse_request(pipeline.llm, lib.llm, q, TMDB_GENRES)
     filters = RecFilters(
         min_rating=min_rating,
         rating_source=rating_source,
         hide_low_quality=hide_low_quality,
         quality_rt=cfg.quality_floor_tomatometer,
         quality_imdb=cfg.quality_floor_imdb,
-        genres=tuple(genre or ()),
-        decade=decade,
-        max_runtime=max_runtime,
-        language=language or None,
+        genres=tuple(genre or ()) or (request.genres if request else ()),
+        decade=decade if decade is not None else (request.decade if request else None),
+        max_runtime=max_runtime if max_runtime is not None else (request.max_runtime if request else None),
+        language=language or (request.language if request else None),
     )
-    out = pipeline.recommend(lib, db, limit=max(1, min(limit, 200)), filters=filters)
+    out = pipeline.recommend(
+        lib, db, limit=max(1, min(limit, 200)), filters=filters, request=request,
+        rerank=rerank and pipeline.llm.enabled,
+    )
     if out is None:
         return {"ready": False, "message": _not_ready(lib, pipeline), "items": []}
     result, blend = out
@@ -442,6 +457,12 @@ def get_recommendations(
         "facets": asdict(result.facets),
         "collab_films": result.collab_films,
         "blend_mode": blend.mode,
+        "llm": {
+            "available": pipeline.llm.enabled,
+            "reranked": result.reranked,
+            "message": result.llm_message,
+        },
+        "request": None if request is None else {**asdict(request), "note": request_note},
     }
 
 
@@ -479,6 +500,7 @@ def get_metrics(session: UserSessionDep, db: DbDep, pipeline: PipelineDep) -> di
             "daily_limit": cfg.omdb_daily_limit,
         },
         "candidates": {"total": len(lib.eligible_ids()), "by_source": dict(sources.most_common())},
+        "llm": pipeline.llm.usage(lib.llm),
     }
 
 

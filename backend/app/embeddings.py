@@ -24,6 +24,10 @@ class Embedder(Protocol):
         """Return an (n, d) float32 array of L2-normalized embeddings."""
         ...
 
+    def embed_query(self, text: str) -> np.ndarray:
+        """Embed a short search query (BGE models want a query prefix)."""
+        ...
+
 
 class OnnxEmbedder:
     """BGE sentence embeddings with onnxruntime instead of PyTorch: the model's

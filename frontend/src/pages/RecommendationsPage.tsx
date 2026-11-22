@@ -6,6 +6,7 @@ import {
   posterUrl,
   type Recommendation,
   type RecommendationsResponse,
+  type RequestInterpretation,
   type TasteResponse,
 } from "../api";
 
@@ -24,23 +25,51 @@ export default function RecommendationsPage() {
     api.taste().then(setTaste).catch(() => {});
   }, []);
 
+  const q = params.get("q") ?? "";
+  const [draft, setDraft] = useState(q);
+  const [refining, setRefining] = useState(false);
+  useEffect(() => setDraft(q), [q]);
+
+  const setQuery = (text: string) => {
+    const next = filtersToParams(filters);
+    if (text.trim()) next.set("q", text.trim());
+    setParams(next, { replace: true });
+  };
+
+  // Two phases: the fast ranking renders at once, then the AI re-order swaps in.
+  // `cancelled` + abort make sure a slow response for old inputs never lands.
   useEffect(() => {
     let cancelled = false;
+    const ctl = new AbortController();
+    const opts = { q, signal: ctl.signal };
     setLoading(true);
+    setRefining(false);
     api
-      .recommendations(60, filters)
+      .recommendations(60, filters, { ...opts, rerank: false })
       .then((r) => {
         if (cancelled) return;
         setRecs(r);
         setError(null);
         setSource(ALL);
+        setLoading(false);
+        if (!r.ready || !r.llm?.available) return;
+        setRefining(true);
+        api
+          .recommendations(60, filters, { ...opts, rerank: true })
+          .then((r2) => !cancelled && r2.ready && setRecs(r2))
+          .catch(() => {}) // keep the phase-one list
+          .finally(() => !cancelled && setRefining(false));
       })
-      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)))
-      .finally(() => !cancelled && setLoading(false));
+      .catch((e) => {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : String(e));
+        setLoading(false);
+      });
     return () => {
       cancelled = true;
+      ctl.abort();
     };
-  }, [filters]);
+  }, [filters, q]);
 
   const sources = useMemo(() => {
     const counts = new Map<string, { label: string; n: number }>();
@@ -91,10 +120,62 @@ export default function RecommendationsPage() {
         </p>
       </div>
 
+      <form
+        className="flex gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          setQuery(draft);
+        }}
+      >
+        <div className="relative min-w-0 flex-1">
+          <input
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            maxLength={300}
+            placeholder={'Ask for something: "a tense 90-minute thriller", "like Arrival but lighter"'}
+            className="w-full rounded-md border border-zinc-700 bg-zinc-900 py-2 pl-3 pr-8 text-sm placeholder:text-zinc-600 focus:border-emerald-500 focus:outline-none"
+          />
+          {q && (
+            <button
+              type="button"
+              aria-label="Clear request"
+              title="Clear request"
+              onClick={() => setQuery("")}
+              className="absolute right-1 top-1/2 -translate-y-1/2 px-2 text-lg leading-none text-zinc-500 hover:text-white"
+            >
+              ×
+            </button>
+          )}
+        </div>
+        <button
+          type="submit"
+          disabled={!draft.trim() || draft.trim() === q}
+          className="shrink-0 rounded-md bg-emerald-600 px-4 py-2 text-sm hover:bg-emerald-500 disabled:opacity-40 disabled:hover:bg-emerald-600"
+        >
+          Ask
+        </button>
+      </form>
+
+      {recs.request && <Interpreted request={recs.request} />}
+
+      {(refining || recs.llm?.reranked || (recs.llm?.message && !refining)) && (
+        <p className="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+          {refining && <span className="animate-pulse">AI is picking and explaining…</span>}
+          {!refining && recs.llm?.reranked && (
+            <span className="rounded bg-emerald-950/60 px-1.5 py-0.5 text-emerald-300">AI-ranked</span>
+          )}
+          {!refining && !recs.llm?.reranked && recs.llm?.message && <span>{recs.llm.message}</span>}
+        </p>
+      )}
+
       <FilterBar
         filters={filters}
         facets={recs.facets}
-        onChange={(next) => setParams(filtersToParams(next), { replace: true })}
+        onChange={(next) => {
+          const p = filtersToParams(next);
+          if (q) p.set("q", q);
+          setParams(p, { replace: true });
+        }}
       />
 
       {recs.total !== undefined && hasFilters(filters) && (
@@ -129,6 +210,35 @@ export default function RecommendationsPage() {
             <RecCard key={r.tmdb_id} rec={r} rank={recs.items.indexOf(r) + 1 || i + 1} collabOn={recs.collab_films != null} />
           ))}
         </div>
+      )}
+    </div>
+  );
+}
+
+function Interpreted({ request: r }: { request: RequestInterpretation }) {
+  const chips = [
+    ...r.genres,
+    ...(r.decade ? [`${r.decade}s`] : []),
+    ...(r.max_runtime ? [`≤ ${r.max_runtime} min`] : []),
+    ...(r.language ? [r.language] : []),
+    ...r.keywords,
+  ];
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 text-xs">
+      {r.by_llm ? (
+        <>
+          <span className="text-zinc-500">Interpreted as:</span>
+          {chips.map((c, i) => (
+            <span key={`${c}:${i}`} className="rounded-full border border-zinc-700 px-2 py-0.5 text-zinc-300">
+              {c}
+            </span>
+          ))}
+          {chips.length === 0 && <span className="text-zinc-500">no specific filters</span>}
+        </>
+      ) : (
+        <span className="text-zinc-500">
+          Searched your words directly{r.note ? ` (AI unavailable: ${r.note})` : ""}
+        </span>
       )}
     </div>
   );
@@ -193,6 +303,14 @@ function RecCard({ rec, rank, collabOn }: { rec: Recommendation; rank: number; c
           )}
           <Ratings rec={rec} />
         </div>
+        {rec.why && (
+          <p className="text-xs italic text-zinc-300">
+            {rec.why_source === "llm" && (
+              <span className="mr-1 rounded bg-emerald-950/60 px-1 text-[10px] not-italic text-emerald-300">AI</span>
+            )}
+            {rec.why}
+          </p>
+        )}
         {rec.profile_score !== null && (
           <ScoreBar
             label="① taste profile"

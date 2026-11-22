@@ -152,9 +152,24 @@ class Settings(BaseSettings):
     recommend_min_runtime: int = 40  # minutes; hides shorts (unless watchlisted). 0 shows everything
     top_n: int = 20
 
-    # --- LLM ---
-    llm_rerank_pool: int = 30
-    llm_max_position_shift: int = 10
+    # --- LLM (app/llm.py; everything works without OPENAI_API_KEY) ---
+    llm_rerank_pool: int = 30  # blended top N sent to the model
+    llm_rerank_keep: int = 20  # films it orders and explains
+    llm_max_position_shift: int = 10  # max places it may move a film, either way
+    llm_liked_examples: int = 15  # your top-rated films shown to it
+    llm_disliked_examples: int = 10  # and your lowest-rated
+    llm_timeout_seconds: float = 30.0
+    # Cost guards for a public deployment: calls across all users per UTC day,
+    # and per session. Cached answers don't count.
+    llm_daily_call_limit: int = 500  # 0 = unlimited
+    llm_calls_per_session: int = 40  # 0 = unlimited
+    # USD per million tokens, for the cost shown on the metrics page (gpt-4o-mini's).
+    llm_price_input_per_mtok: float = 0.15
+    llm_price_output_per_mtok: float = 0.60
+    # Natural-language requests: weight of the request's query vector vs your
+    # taste in the ranking, and how many extra films to pull from the shared index.
+    llm_query_weight: float = 0.5
+    llm_query_extra_candidates: int = 150
 
     @property
     def db_path(self) -> Path:
