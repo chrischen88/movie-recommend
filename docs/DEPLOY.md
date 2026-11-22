@@ -30,6 +30,7 @@ The whole app runs as one Fly Machine. FastAPI serves both the API and the built
 ## Day to day
 
 - **Code changes:** `make fly-deploy`. A deploy discards the suspend snapshot, so the next visit is a full cold start (seconds, not milliseconds).
+- **New or changed sample profiles** (`backend/app/demo.py`): after deploying, pick each one in the dropdown once (or run `make fly-push-data` with a local copy that has them). The first run fetches and embeds its films, which can take a few minutes; later runs take seconds.
 - **A newer Letterboxd export:** upload it in the UI. Films already in the shared cache cost no API calls.
 - **Replacing the server's film data with your local copy:** `make fly-push-data`. This **overwrites** the server's cache and index, including films other users brought in. There's no user data to lose.
 - **Logs and a shell:** `fly logs`, `fly ssh console`.

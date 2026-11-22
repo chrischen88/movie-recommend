@@ -2,7 +2,7 @@
 
 A web app that recommends films from your Letterboxd export, run locally or hosted for several people. It blends three scores into one ranked list: a content-based taste profile, embedding similarity from a vector DB, and collaborative filtering.
 
-> **Status:** milestones 1–6 of 8 are done, plus hosting as a multi-user service. See [docs/PROGRESS.md](docs/PROGRESS.md).
+> **Status:** milestones 1–6 of 8 are done, the core of milestone 7 (the OpenAI layer) is done, and the app is hosted as a multi-user service. See [docs/PROGRESS.md](docs/PROGRESS.md).
 
 ## Setup
 
@@ -23,6 +23,8 @@ make recommend EXPORT=sample_letterboxd_export.zip   # or run an export in the t
 make train                                    # MovieLens model for score ③ (FORCE=1 to retrain)
 ```
 
+**No export?** The upload page has three sample profiles to pick from a dropdown: arthouse & world cinema, family animation, and John Wick-style action. Each is a made-up viewer with 60+ ratings (`backend/app/demo.py`) that goes through the same pipeline as a real upload.
+
 **Nothing about you is stored.** An upload is processed in server memory and deleted after an hour without use, when you click "Forget my data now", or when the server restarts. What's kept, and shared by everyone, is film data: cached TMDB/OMDb responses, film metadata, film embeddings and the MovieLens model. So each export makes the next one cheaper: films someone else already brought in cost no API calls. Match fixes you make are saved in your browser and re-applied to your next upload.
 
 ## Hosting
@@ -38,13 +40,20 @@ backend/app/
   cache.py       SQLite response cache (TTL), rate limiter, retrying HTTP client
   letterboxd.py  export ZIP parser, which merges ratings/watched/diary/watchlist/reviews
   library.py     a user's films, candidates and models, in memory only
+  demo.py        the built-in sample profiles, built as export ZIPs
   sessions.py    in-memory sessions, upload limits and the run queue
   tmdb.py        TMDB client (v3 key or v4 bearer token) + metadata parsing
   matching.py    title/year → TMDB id matching with confidence scores
-  pipeline.py    per-session run: matching → enrichment → collab → candidates → embedding → taste → blend → omdb
+  pipeline.py    per-session run: matching → enrichment → collab → candidates → embedding → taste → blend → omdb → ai
   embeddings.py  film documents + ONNX Runtime embedder (BGE-small)
   vectorstore.py VectorStore interface: ChromaStore (default) + InMemoryStore
   taste.py       taste vector, k-means taste clusters, score ②
+  profile.py     content-based taste profile, score ①
+  movielens.py   MovieLens download and TMDB id links
+  collab.py      collaborative-filtering model, score ③
+  blend.py       learned weights for blending ①②③
+  omdb.py        IMDb / Rotten Tomatoes / Metacritic ratings via OMDb
+  llm.py         OpenAI layer: AI re-rank, explanations, typed requests
   recommend.py   assembles the ranked recommendation list
   main.py        FastAPI app
   cli.py         `python -m app.cli recommend <zip>`, `train`
