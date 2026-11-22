@@ -71,7 +71,7 @@ class UserSession:
     upload: dict[str, Any]  # what parsing found (counts, warnings), kept for each run's stats
     files_found: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    demo: bool = False  # on the built-in sample profile (app/demo.py)
+    demo: str | None = None  # the built-in sample profile's id (app/demo.py), if on one
 
 
 class InlineExecutor(Executor):
@@ -111,7 +111,7 @@ class SessionStore:
         *,
         files_found: list[str] | None = None,
         warnings: list[str] | None = None,
-        demo: bool = False,
+        demo: str | None = None,
     ) -> UserSession:
         with self._lock:
             self._sweep()

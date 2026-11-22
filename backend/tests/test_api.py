@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -405,19 +406,30 @@ def test_upload_limits(engine: Engine, sample_zip: bytes) -> None:
     app.dependency_overrides.clear()
 
 
-def test_demo_export_is_clean_and_big_enough_to_learn() -> None:
-    export = parse_export(demo.demo_export_zip())
+@pytest.mark.parametrize("profile_id", list(demo.PROFILES))
+def test_demo_exports_are_clean_and_big_enough_to_learn(profile_id: str) -> None:
+    profile = demo.PROFILES[profile_id]
+    export = parse_export(demo.demo_export_zip(profile_id))
     assert export.warnings == []
-    assert export.username == demo.USERNAME
-    assert len(export.rated) == len(demo.RATED) >= get_settings().blend_min_ratings_for_learning
-    assert len(export.watchlist) == len(demo.WATCHLIST)
+    assert export.username == profile.username
+    assert len(export.rated) == len(profile.rated) >= get_settings().blend_min_ratings_for_learning
+    assert len(export.watchlist) == len(profile.watchlist)
+    titles = [(n, y) for n, y, _ in profile.rated] + profile.watchlist
+    assert len(set(titles)) == len(titles)
+
+
+def test_frontend_offers_exactly_the_demo_profiles() -> None:
+    src = (Path(__file__).parents[2] / "frontend/src/api.ts").read_text()
+    offered = set(re.findall(r'\{ id: "([a-z]+)", label:', src))
+    assert offered == set(demo.PROFILES)
 
 
 def test_demo_session(client: TestClient) -> None:
     resp = client.post("/api/sessions/demo")
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["stats"]["films"] == len(demo.RATED) + len(demo.WATCHLIST)
+    arthouse = demo.PROFILES[demo.DEFAULT_PROFILE]
+    assert body["stats"]["films"] == len(arthouse.rated) + len(arthouse.watchlist)
     assert body["stats"]["fixes_applied"] == 0
     client.headers["X-Session-Id"] = body["session_id"]
     assert client.get("/api/session").json()["run"]["status"] == "done"
@@ -451,6 +463,19 @@ def test_repeat_demo_clicks_reuse_the_session(client: TestClient) -> None:
         assert again.json()["session_id"] == first["session_id"]
         assert again.json()["stats"] == first["stats"]
     assert len(store_of()) == 1
+
+
+def test_demo_profiles_are_picked_by_id(client: TestClient) -> None:
+    family = client.post("/api/sessions/demo", params={"profile": "family"}).json()
+    profile = demo.PROFILES["family"]
+    assert family["stats"]["films"] == len(profile.rated) + len(profile.watchlist)
+    client.headers["X-Session-Id"] = family["session_id"]
+    # Picking another profile starts a new session in place of the old one.
+    action = client.post("/api/sessions/demo", params={"profile": "action"}).json()
+    assert action["session_id"] != family["session_id"]
+    assert store_of().get(family["session_id"]) is None and len(store_of()) == 1
+    bad = client.post("/api/sessions/demo", params={"profile": "horror"})
+    assert bad.status_code == 400 and "arthouse" in bad.json()["detail"]
 
 
 def test_new_session_replaces_the_callers_previous_one(client: TestClient, sample_zip: bytes) -> None:

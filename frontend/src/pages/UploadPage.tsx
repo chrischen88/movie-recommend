@@ -1,6 +1,15 @@
 import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { api, clearSavedFixes, hasSession, savedFixes, type RunOut, type UploadResult } from "../api";
+import {
+  api,
+  clearSavedFixes,
+  hasSession,
+  SAMPLE_PROFILES,
+  savedFixes,
+  type RunOut,
+  type SampleProfileId,
+  type UploadResult,
+} from "../api";
 
 const POLL_MS = 800;
 // After this long without a reply, say the server is probably waking up (it
@@ -24,6 +33,7 @@ export default function UploadPage() {
   const [dragging, setDragging] = useState(false);
   const [starting, setStarting] = useState<"upload" | "demo" | null>(null);
   const [slowStart, setSlowStart] = useState(false);
+  const [sample, setSample] = useState<SampleProfileId>("arthouse");
   const startingRef = useRef(false);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const scrollToPanel = useRef(false);
@@ -135,6 +145,7 @@ export default function UploadPage() {
   };
 
   const uploading = starting !== null;
+  const sampleInfo = SAMPLE_PROFILES.find((p) => p.id === sample) ?? SAMPLE_PROFILES[0];
   const running = runOut !== null && isActive(runOut);
 
   return (
@@ -183,9 +194,25 @@ export default function UploadPage() {
         </span>
       </label>
 
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-sm">
+        <label className="sr-only" htmlFor="sample-profile">
+          Sample profile
+        </label>
+        <select
+          id="sample-profile"
+          value={sample}
+          onChange={(e) => setSample(e.target.value as SampleProfileId)}
+          disabled={running || uploading}
+          className="rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-zinc-200 hover:border-zinc-500 disabled:opacity-50"
+        >
+          {SAMPLE_PROFILES.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.label}
+            </option>
+          ))}
+        </select>
         <button
-          onClick={() => void start("demo", api.demo)}
+          onClick={() => void start("demo", () => api.demo(sample))}
           disabled={running || uploading}
           aria-busy={starting === "demo"}
           className={`inline-flex items-center gap-2 rounded-md border px-3 py-1.5 ${
@@ -202,7 +229,7 @@ export default function UploadPage() {
         <span className="text-zinc-500" aria-live="polite">
           {slowStart && starting === "demo"
             ? "Waking up the server, this can take a few seconds…"
-            : "No export? See recommendations for a made-up viewer with 68 rated films."}
+            : `No export? See recommendations for a made-up viewer who loves ${sampleInfo.blurb}.`}
         </span>
       </div>
 

@@ -275,7 +275,7 @@ let sessionEnded = false;
 export const noSessionMessage = () =>
   sessionEnded
     ? "Your session ended (it's deleted after an hour without use). Upload your export again."
-    : "Upload your Letterboxd export, or try the sample profile, to get started.";
+    : "Upload your Letterboxd export, or try a sample profile, to get started.";
 
 export function savedFixes(): Record<string, MatchFix> {
   try {
@@ -350,6 +350,14 @@ async function startSession(upload: Promise<UploadResult>): Promise<UploadResult
   return result;
 }
 
+/** The built-in sample profiles (backend/app/demo.py; a backend test keeps the ids in sync). */
+export const SAMPLE_PROFILES = [
+  { id: "arthouse", label: "Arthouse & world cinema", blurb: "slow-burn international films and cerebral sci-fi" },
+  { id: "family", label: "Family animation", blurb: "Pixar, Ghibli, Aardman and Laika" },
+  { id: "action", label: "Action, John Wick-style", blurb: "choreographed gun-fu and martial arts" },
+] as const;
+export type SampleProfileId = (typeof SAMPLE_PROFILES)[number]["id"];
+
 export const api = {
   health: () => request<Health>("/api/health"),
   upload: async (file: File) => {
@@ -358,8 +366,11 @@ export const api = {
     body.append("fixes", JSON.stringify(savedFixes()));
     return startSession(request<UploadResult>("/api/sessions", { method: "POST", body }));
   },
-  /** A session on the built-in sample profile, for visitors without an export. */
-  demo: () => startSession(request<UploadResult>("/api/sessions/demo", { method: "POST" })),
+  /** A session on one of the built-in sample profiles, for visitors without an export. */
+  demo: (profile: SampleProfileId) =>
+    startSession(
+      request<UploadResult>(`/api/sessions/demo?profile=${encodeURIComponent(profile)}`, { method: "POST" }),
+    ),
   session: () => withSession<RunOut | null>(() => request<RunOut>("/api/session"), () => null),
   reprocess: () => request<RunOut>("/api/session/reprocess", { method: "POST" }),
   forget: async () => {

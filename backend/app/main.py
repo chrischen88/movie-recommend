@@ -30,7 +30,7 @@ from app.cache import ResponseCache
 from app.collab import load_scorer
 from app.config import get_settings
 from app.db import Movie, get_session, utcnow
-from app.demo import demo_export_zip
+from app.demo import DEFAULT_PROFILE, PROFILES, demo_export_zip
 from app.letterboxd import ExportError, parse_export
 from app.library import InvalidFixes, Library, LibraryFilm, applied_fixes, library_from_export
 from app.llm import TMDB_GENRES, parse_request
@@ -180,20 +180,24 @@ async def create_demo_session(
     request: Request,
     store: StoreDep,
     pipeline: PipelineDep,
+    profile: str = DEFAULT_PROFILE,
     x_session_id: Annotated[str | None, Header()] = None,
 ) -> dict[str, object]:
-    """A session on the built-in sample profile (app/demo.py), for visitors
-    without an export. The browser's saved fixes belong to their own export, so
+    """A session on one of the built-in sample profiles (app/demo.py), for
+    visitors without an export. The browser's saved fixes belong to their own export, so
     they aren't applied here.
 
     Idempotent per browser: if the caller already has a demo session that hasn't
     failed, that one is returned (its run keeps going) without counting toward
-    the rate limit, so repeated clicks while the server wakes up are harmless."""
+    the rate limit, so repeated clicks while the server wakes up are harmless.
+    Picking a different profile starts a new session."""
+    if profile not in PROFILES:
+        raise HTTPException(400, f"Unknown sample profile {profile!r}; choose one of {', '.join(PROFILES)}")
     existing = store.get(x_session_id)
-    if existing is not None and existing.demo and existing.run.status not in ("error", "cancelled"):
+    if existing is not None and existing.demo == profile and existing.run.status not in ("error", "cancelled"):
         return _session_reply(store, existing)
     _check_upload_rate(request, store, demo=True)
-    return await _start_session(demo_export_zip(), {}, store, pipeline, demo=True, replaces=x_session_id)
+    return await _start_session(demo_export_zip(profile), {}, store, pipeline, demo=profile, replaces=x_session_id)
 
 
 def _check_upload_rate(request: Request, store: SessionStore, *, demo: bool = False) -> None:
@@ -209,7 +213,7 @@ async def _start_session(
     store: SessionStore,
     pipeline: Pipeline,
     *,
-    demo: bool = False,
+    demo: str | None = None,
     replaces: str | None = None,
 ) -> dict[str, object]:
     """Parse `data` into a new session and queue its run. `replaces` is the
