@@ -91,7 +91,7 @@ def test_upload_runs_pipeline(client: TestClient, sample_zip: bytes) -> None:
 
     # The inline executor runs the pipeline before the upload returns.
     out = client.get("/api/session").json()
-    assert out["stages"] == ["parsing", "matching", "enrichment", "collab", "candidates", "embedding", "taste", "blend", "omdb"]
+    assert out["stages"] == ["parsing", "matching", "enrichment", "collab", "candidates", "embedding", "taste", "blend", "omdb", "ai"]
     assert out["run"]["status"] == "done" and out["queue_position"] is None
     assert out["run"]["stats"]["matching"]["matched"] == 34
     assert out["run"]["stats"]["films"] == 35  # upload counts carried into the run
@@ -537,3 +537,22 @@ def test_api_responses_are_never_cached(client: TestClient) -> None:
     assert client.get("/api/session").status_code == 410
     assert client.get("/api/session").headers["cache-control"] == "no-store"
     assert client.get("/api/health").headers["cache-control"] == "no-store"
+
+
+def test_ai_picks_are_prepared_during_processing(engine: Engine, sample_zip: bytes) -> None:
+    from tests.fake_llm import FakeLLM
+
+    fake = fake_for_sample()
+    with make_client(engine, fake) as c:
+        llm = FakeLLM()
+        with_llm(c, llm)
+        body = upload(c, sample_zip)
+        run = c.get("/api/session").json()["run"]
+        assert run["stats"]["ai"]["prepared"] is True
+        made = len(llm.calls)
+        assert made > 0
+        # Opening the page (any length) uses the prepared answers: no new calls.
+        page = c.get("/api/recommendations", params={"limit": 60, "rerank": True}).json()
+        assert page["llm"]["reranked"] is True and len(llm.calls) == made
+        assert body["session_id"]
+    app.dependency_overrides.clear()

@@ -17,6 +17,7 @@ const STAGE_LABELS: Record<string, string> = {
   taste: "Building your taste profile",
   blend: "Learning how to weigh the scores",
   omdb: "Fetching IMDb / Rotten Tomatoes ratings",
+  ai: "Picking and explaining with AI",
 };
 
 export default function UploadPage() {

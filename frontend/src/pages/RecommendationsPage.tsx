@@ -12,6 +12,8 @@ import {
 
 const ALL = "__all__";
 
+const AI_WAIT_MS = 15000;
+
 export default function RecommendationsPage() {
   const [recs, setRecs] = useState<RecommendationsResponse | null>(null);
   const [taste, setTaste] = useState<TasteResponse | null>(null);
@@ -28,6 +30,9 @@ export default function RecommendationsPage() {
   const q = params.get("q") ?? "";
   const [draft, setDraft] = useState(q);
   const [refining, setRefining] = useState(false);
+  // AI picks that arrived after the standard ranking was already shown: offered
+  // with a button, never swapped in under the reader.
+  const [aiReady, setAiReady] = useState<RecommendationsResponse | null>(null);
   useEffect(() => setDraft(q), [q]);
 
   const setQuery = (text: string) => {
@@ -36,29 +41,50 @@ export default function RecommendationsPage() {
     setParams(next, { replace: true });
   };
 
-  // Two phases: the fast ranking renders at once, then the AI re-order swaps in.
+  // When AI is available, wait for its picks (usually instant: they're prepared
+  // while the export is processed) instead of showing a list that then reorders.
+  // If they take longer than AI_WAIT_MS, show the standard ranking and offer the
+  // AI picks with a button when they arrive.
   // `cancelled` + abort make sure a slow response for old inputs never lands.
   useEffect(() => {
     let cancelled = false;
+    let fallbackShown = false;
+    let fallback: number | undefined;
     const ctl = new AbortController();
     const opts = { q, signal: ctl.signal };
     setLoading(true);
     setRefining(false);
+    setAiReady(null);
+    const show = (r: RecommendationsResponse) => {
+      setRecs(r);
+      setError(null);
+      setSource(ALL);
+      setLoading(false);
+    };
     api
       .recommendations(60, filters, { ...opts, rerank: false })
       .then((r) => {
         if (cancelled) return;
-        setRecs(r);
-        setError(null);
-        setSource(ALL);
-        setLoading(false);
-        if (!r.ready || !r.llm?.available) return;
+        if (!r.ready || !r.llm?.available) return show(r);
         setRefining(true);
+        fallback = window.setTimeout(() => {
+          if (cancelled) return;
+          fallbackShown = true;
+          show(r);
+        }, AI_WAIT_MS);
         api
           .recommendations(60, filters, { ...opts, rerank: true })
-          .then((r2) => !cancelled && r2.ready && setRecs(r2))
-          .catch(() => {}) // keep the phase-one list
-          .finally(() => !cancelled && setRefining(false));
+          .then((r2) => {
+            if (cancelled) return;
+            const best = r2.ready ? r2 : r;
+            if (fallbackShown && best.llm?.reranked) setAiReady(best);
+            else if (!fallbackShown) show(best);
+          })
+          .catch(() => !cancelled && !fallbackShown && show(r))
+          .finally(() => {
+            window.clearTimeout(fallback);
+            if (!cancelled) setRefining(false);
+          });
       })
       .catch((e) => {
         if (cancelled) return;
@@ -67,6 +93,7 @@ export default function RecommendationsPage() {
       });
     return () => {
       cancelled = true;
+      window.clearTimeout(fallback);
       ctl.abort();
     };
   }, [filters, q]);
@@ -85,7 +112,11 @@ export default function RecommendationsPage() {
   if (error) {
     return <div className="rounded-md bg-red-950/50 border border-red-800 p-3 text-red-300">{error}</div>;
   }
-  if (!recs) return <p className="text-zinc-500">Loading…</p>;
+  if (!recs) {
+    return <p className={refining ? "animate-pulse text-zinc-400" : "text-zinc-500"}>
+      {refining ? "AI is picking and explaining your films…" : "Loading…"}
+    </p>;
+  }
   if (!recs.ready) {
     return (
       <div className="rounded-xl border border-zinc-800 p-8 text-center space-y-3">
@@ -158,13 +189,39 @@ export default function RecommendationsPage() {
 
       {recs.request && <Interpreted request={recs.request} />}
 
-      {(refining || recs.llm?.reranked || (recs.llm?.message && !refining)) && (
-        <p className="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
-          {refining && <span className="animate-pulse">AI is picking and explaining…</span>}
-          {!refining && recs.llm?.reranked && (
-            <span className="rounded bg-emerald-950/60 px-1.5 py-0.5 text-emerald-300">AI-ranked</span>
+      {(refining || aiReady || recs.llm?.reranked || recs.llm?.message) && (
+        <p className="flex flex-wrap items-center gap-2 text-xs text-zinc-500" aria-live="polite">
+          {refining && loading && (
+            <span className="animate-pulse">AI is picking and explaining films for these settings…</span>
           )}
-          {!refining && !recs.llm?.reranked && recs.llm?.message && <span>{recs.llm.message}</span>}
+          {refining && !loading && (
+            <span className="animate-pulse">
+              Showing the standard ranking while AI picks and explains (you'll be asked before the list changes)…
+            </span>
+          )}
+          {aiReady && (
+            <>
+              <span>AI picks are ready.</span>
+              <button
+                onClick={() => {
+                  setRecs(aiReady);
+                  setAiReady(null);
+                  setSource(ALL);
+                }}
+                className="rounded bg-emerald-700 px-2 py-0.5 text-white hover:bg-emerald-600"
+              >
+                Show AI picks
+              </button>
+            </>
+          )}
+          {!loading && recs.llm?.reranked && (
+            <span className="rounded bg-emerald-950/60 px-1.5 py-0.5 text-emerald-300" title="Ordered and explained by AI">
+              AI-ranked
+            </span>
+          )}
+          {!loading && !refining && !aiReady && !recs.llm?.reranked && recs.llm?.message && (
+            <span>Standard ranking ({recs.llm.message})</span>
+          )}
         </p>
       )}
 

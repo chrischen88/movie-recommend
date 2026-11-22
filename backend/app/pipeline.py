@@ -47,7 +47,7 @@ from app.vectorstore import ChromaStore, Metadata, VectorStore
 
 log = logging.getLogger(__name__)
 
-STAGES = ["parsing", "matching", "enrichment", "collab", "candidates", "embedding", "taste", "blend", "omdb"]
+STAGES = ["parsing", "matching", "enrichment", "collab", "candidates", "embedding", "taste", "blend", "omdb", "ai"]
 PROGRESS_FLUSH_SECONDS = 0.5
 # Index metadata that described one user's library; stripped at startup.
 LEGACY_INDEX_KEYS = ("seen",)
@@ -159,6 +159,10 @@ class Pipeline:
                 log.warning(messages[-1])
             if "budget_exhausted" in stats["omdb"]:
                 messages.append("OMDb daily request budget reached: some ratings are missing until tomorrow")
+            if self.llm.enabled:
+                self._check(run)
+                self._update(run, stage="ai", progress_done=0, progress_total=0)
+                stats["ai"] = self.prepare_ai_picks(lib)
 
         self._update(
             run, stats={**run.stats, **stats}, stage="done", status="done",
@@ -577,6 +581,22 @@ class Pipeline:
             result.items, result.reranked, result.llm_message = out.items, out.reordered, out.message
         result.items = result.items[:limit]
         return result, blend
+
+    def prepare_ai_picks(self, lib: Library) -> dict[str, object]:
+        """Run the AI re-rank for the default recommendations view now, so its
+        answers are in the session's cache when the user opens the page: the
+        list then shows in AI order at once instead of reordering under them.
+        Never fails the run; the page falls back to asking again."""
+        try:
+            with Session(self.engine) as s:
+                out = self.recommend(lib, s, limit=self.settings.llm_explain_count, rerank=True)
+        except Exception:  # noqa: BLE001 — the AI step is optional
+            log.exception("preparing AI picks failed")
+            return {"prepared": False}
+        if out is None:
+            return {"prepared": False}
+        result = out[0]
+        return {"prepared": result.reranked, "message": result.llm_message}
 
     def add_similar_rated(self, lib: Library, items: list[Recommendation]) -> None:
         """For each film, the user's most similar highly rated films (by
