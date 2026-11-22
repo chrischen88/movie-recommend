@@ -295,18 +295,23 @@ def _is_short(r: Recommendation, min_runtime: int) -> bool:
     return not r.in_watchlist and r.runtime is not None and 0 < r.runtime < min_runtime
 
 
+MMR_POOL = 200
+
+
 def mmr(
     ranked: list[Recommendation], embeddings: Mapping[int, np.ndarray], lam: float, k: int
 ) -> list[Recommendation]:
     """Maximal marginal relevance: repeatedly take the film with the best
     λ·score − (1−λ)·(max cosine to films already picked), so the top `k` aren't
-    near-duplicates. Only the best 3k (at least 60) are considered; λ=1 keeps
-    the ranking as is.
+    near-duplicates. Only the best `MMR_POOL` (or k, if more) are considered, a
+    fixed number so that the first n picks are the same for any k ≥ n: the AI
+    picks prepared during processing are cached by their exact list, and the
+    page asks for a different length. λ=1 keeps the ranking as is.
 
     Relevance is rescaled to 0–1 within that pool: the scores are percentiles
     over every candidate, so the top 60 all sit near 1 and would otherwise be
     swamped by the similarity term, ranking by novelty instead of fit."""
-    pool = [r for r in ranked[: max(3 * k, 60)] if r.tmdb_id in embeddings]
+    pool = [r for r in ranked[: max(k, MMR_POOL)] if r.tmdb_id in embeddings]
     if not pool:
         return ranked[:k]
     vecs = np.stack([embeddings[r.tmdb_id] for r in pool]).astype(np.float32)

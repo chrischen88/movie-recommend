@@ -112,3 +112,12 @@ def test_shorts_hidden_unless_watchlisted() -> None:
     assert not _is_short(rec(runtime=90), 40)
     assert not _is_short(rec(runtime=None), 40)  # unknown runtime: keep
     assert not _is_short(rec(runtime=8), 0)  # disabled
+
+
+def test_mmr_prefix_doesnt_depend_on_k() -> None:
+    # The AI picks prepared during processing (k=40) must match the page's list (k=60).
+    rng = np.random.default_rng(1)
+    ranked = [rec(tmdb_id=i, score=1 - i / 400) for i in range(400)]
+    emb = {i: rng.normal(size=16).astype(np.float32) for i in range(400)}
+    short, long = mmr(ranked, emb, 0.7, 40), mmr(ranked, emb, 0.7, 60)
+    assert [r.tmdb_id for r in long[:40]] == [r.tmdb_id for r in short]
