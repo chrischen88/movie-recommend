@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { api, clearSavedFixes, hasSession, savedFixes, type RunOut, type UploadResult } from "../api";
 
 const POLL_MS = 800;
@@ -26,6 +26,11 @@ export default function UploadPage() {
   const startingRef = useRef(false);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const scrollToPanel = useRef(false);
+  // Set by the sample-profile button: once that run is done, go straight to the
+  // recommendations. (A repeat click returns the same, already finished session,
+  // which would otherwise leave the page looking exactly as it was.)
+  const openWhenDone = useRef(false);
+  const navigate = useNavigate();
   const [error, setError] = useState<string | null>(null);
   const [upload, setUpload] = useState<UploadResult | null>(null);
   const [runOut, setRunOut] = useState<RunOut | null>(null);
@@ -38,6 +43,12 @@ export default function UploadPage() {
     const tick = async () => {
       try {
         const out = await api.session();
+        if (out?.run.status === "done" && openWhenDone.current) {
+          openWhenDone.current = false;
+          navigate("/recommendations");
+          return;
+        }
+        if (out && !isActive(out)) openWhenDone.current = false;
         setRunOut(out);
         if (out && isActive(out)) timer.current = window.setTimeout(tick, POLL_MS);
       } catch (e) {
@@ -45,7 +56,7 @@ export default function UploadPage() {
       }
     };
     void tick();
-  }, []);
+  }, [navigate]);
 
   useEffect(() => {
     if (hasSession()) poll();
@@ -63,12 +74,14 @@ export default function UploadPage() {
     setError(null);
     setUpload(null);
     const slow = window.setTimeout(() => setSlowStart(true), SLOW_START_MS);
+    openWhenDone.current = kind === "demo";
     try {
       const result = await begin();
       setUpload(result);
       scrollToPanel.current = true;
       poll();
     } catch (e) {
+      openWhenDone.current = false;
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       window.clearTimeout(slow);
