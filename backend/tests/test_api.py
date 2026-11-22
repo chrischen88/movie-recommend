@@ -489,7 +489,7 @@ def test_llm_rerank_reorders_and_explains(client: TestClient, sample_zip: bytes)
     assert body["llm"]["reranked"] is True
     ids = [r["tmdb_id"] for r in body["items"]]
     assert len(ids) == 3 and ids != [r["tmdb_id"] for r in plain]
-    assert all(r["why_source"] == "llm" and r["why"] == f"Because of film {r['tmdb_id']}." for r in body["items"])
+    assert all(r["why_source"] == "llm" and r["why"] == f"Because of {r['title']}." for r in body["items"])
     # Same list again: answered from the session's cache.
     client.get("/api/recommendations", params={"limit": 3, "rerank": True})
     assert len(llm.calls) == 1

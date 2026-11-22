@@ -78,19 +78,36 @@ def test_rerank_reorders_the_pool_and_explains(engine: Engine) -> None:
     recs = [rec(t) for t in (1, 2, 3, 4, 5)]
     items, whys = rerank(svc, LLMSessionState(), recs, [RatedExample("Arrival", 2016, 5.0)], [], svc.settings)
     assert [r.tmdb_id for r in items] == [4, 3, 2, 1, 5]  # pool reversed, the rest unchanged
-    assert whys[4] == "Because of film 4."
+    assert whys[4] == "Because of Film 4."
     name, prompt = llm.calls[0]
-    assert name == "rerank" and "Arrival (2016): 5★" in prompt and '"tmdb_id": 5' not in prompt
+    assert name == "rerank" and "Arrival (2016): 5★" in prompt and '"title": "Film 5"' not in prompt
 
 
 def test_rerank_drops_films_the_model_made_up(engine: Engine) -> None:
-    llm = FakeLLM(lambda *_: {"picks": [{"tmdb_id": 999, "why": "Invented."}, {"tmdb_id": 2, "why": "Real."}]})
+    llm = FakeLLM(lambda *_: {"picks": [{"n": 7, "title": "Invented Film", "why": "Invented."},
+                                        {"n": 2, "title": "Film 2", "why": "Real."}]})
     svc = service(engine, llm)
     items, whys = rerank(svc, LLMSessionState(), [rec(1), rec(2)], [], [], svc.settings)
     assert [r.tmdb_id for r in items] == [2, 1] and whys == {2: "Real."}
-    nothing = FakeLLM(lambda *_: {"picks": [{"tmdb_id": 999, "why": "Invented."}]})
+    nothing = FakeLLM(lambda *_: {"picks": [{"n": 9, "title": "Invented Film", "why": "Invented."}]})
     with pytest.raises(LLMUnavailable):
         rerank(service(engine, nothing), LLMSessionState(), [rec(1), rec(2)], [], [], svc.settings)
+
+
+def test_rerank_never_puts_an_explanation_on_the_wrong_film(engine: Engine) -> None:
+    pool = [rec(10, title="Le Trou"), rec(11, title="City of God"), rec(12, title="Heat"), rec(13, title="Ran")]
+    llm = FakeLLM(lambda *_: {"picks": [
+        # Wrong number, but the title names a candidate: the sentence goes on City of God.
+        {"n": 1, "title": "City of God", "why": "Like City of God."},
+        # Right number and title (an article and a year are ignored).
+        {"n": 3, "title": "Heat (1995)", "why": "Like Heat."},
+        # Number and title disagree and the title names nothing: dropped.
+        {"n": 4, "title": "Rashomon", "why": "Like Rashomon."},
+    ]})
+    svc = service(engine, llm, llm_max_position_shift=10)
+    items, whys = rerank(svc, LLMSessionState(), pool, [], [], svc.settings)
+    assert whys == {11: "Like City of God.", 12: "Like Heat."}
+    assert [r.tmdb_id for r in items][:2] == [11, 12]
 
 
 # ---------------------------------------------------------------- service

@@ -264,8 +264,8 @@ RERANK_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {
                 "type": "object",
-                "properties": {"tmdb_id": {"type": "integer"}, "why": {"type": "string"}},
-                "required": ["tmdb_id", "why"],
+                "properties": {"n": {"type": "integer"}, "title": {"type": "string"}, "why": {"type": "string"}},
+                "required": ["n", "title", "why"],
                 "additionalProperties": False,
             },
         }
@@ -277,10 +277,12 @@ RERANK_SCHEMA: dict[str, Any] = {
 RERANK_SYSTEM = """You help a film recommender pick and explain films for one viewer.
 You get the viewer's highest- and lowest-rated films and a list of candidate films the
 recommender already ranked, with its scores. Choose the {keep} candidates this viewer is
-most likely to love and order them best first. For each, write one sentence (at most 25
+most likely to love and order them best first. For each pick give its candidate number
+`n` and its exact `title` (copied from that candidate), then one sentence (at most 25
 words, second person) on why they'll like it, pointing to films they rated when that helps.
-Rules: use only tmdb_ids from the candidate list; never add or invent films; don't state
-facts that aren't in the data you were given."""
+The sentence must be about that candidate and no other.
+Rules: use only candidates from the list; never add or invent films; don't state facts
+that aren't in the data you were given."""
 
 
 @dataclass(frozen=True)
@@ -301,13 +303,14 @@ def rerank_prompt(
 
     lines = ["Viewer's highest-rated films:", *map(film, liked), "", "Viewer's lowest-rated films:", *map(film, disliked),
              "", "Candidates (recommender's order; scores are percentiles, 100 = best match):"]
-    for r in recs:
+    for n, r in enumerate(recs, start=1):
         ext = [f"IMDb {r.imdb_rating:g}" if r.imdb_rating is not None else "",
                f"RT {r.rt_score}%" if r.rt_score is not None else ""]
         reasons = "; ".join(c.label for c in r.profile_reasons[:3] if c.stars > 0)
         lines.append(json.dumps({
-            "tmdb_id": r.tmdb_id,
-            "title": f"{r.title} ({r.year or '?'})",
+            "n": n,
+            "title": r.title,
+            "year": r.year,
             "genres": r.genres,
             "directors": r.directors[:2],
             "overview": (r.overview or "")[:300],
@@ -345,6 +348,31 @@ def constrain_order(original: Sequence[int], proposed: Sequence[int], max_shift:
     return out
 
 
+def _norm_title(t: str) -> str:
+    t = re.sub(r"\(\d{4}\)\s*$", "", t.lower())  # a trailing "(1960)"
+    t = re.sub(r"[^\w]+", " ", t).strip()
+    return re.sub(r"^(the|a|an|le|la|les|l) ", "", t)
+
+
+def _same_title(a: str, b: str) -> bool:
+    x, y = _norm_title(a), _norm_title(b)
+    return bool(x and y) and (x == y or (min(len(x), len(y)) >= 4 and (x in y or y in x)))
+
+
+def _resolve_pick(pool: Sequence[Recommendation], n: object, title: str) -> tuple[Recommendation | None, str]:
+    """Which candidate a pick is about. Its number and title must agree. The
+    sentence is written about the title, so when the number points elsewhere
+    but the title names exactly one candidate, that candidate wins; otherwise
+    the pick is dropped rather than risk an explanation on the wrong film."""
+    by_n = pool[n - 1] if isinstance(n, int) and 1 <= n <= len(pool) else None
+    if by_n is not None and _same_title(by_n.title, title):
+        return by_n, "by_number"
+    named = [r for r in pool if _same_title(r.title, title)]
+    if len(named) == 1:
+        return named[0], "by_title"
+    return None, "dropped"
+
+
 def rerank(
     service: LLMService,
     state: LLMSessionState,
@@ -363,17 +391,19 @@ def rerank(
     keep = min(settings.llm_rerank_keep, len(pool))
     system, user = rerank_prompt(pool, liked, disliked, keep)
     data = service.call(state, system, user, "rerank", RERANK_SCHEMA)
-    ids = {r.tmdb_id for r in pool}
     whys: dict[int, str] = {}
     proposed: list[int] = []
+    moved = dropped = 0
     for p in data.get("picks", []):
-        t, why = p.get("tmdb_id"), str(p.get("why", "")).strip()
-        if t in ids and t not in whys:
-            proposed.append(t)
-            whys[t] = why[:300]
-    dropped = len(data.get("picks", [])) - len(proposed)
-    if dropped:
-        log.warning("llm rerank: ignored %d picks with unknown or repeated ids", dropped)
+        r, how = _resolve_pick(pool, p.get("n"), str(p.get("title", "")))
+        if r is None or r.tmdb_id in whys:
+            dropped += 1
+            continue
+        moved += how == "by_title"
+        proposed.append(r.tmdb_id)
+        whys[r.tmdb_id] = str(p.get("why", "")).strip()[:300]
+    if dropped or moved:
+        log.warning("llm rerank: %d picks dropped (unknown, mismatched or repeated), %d matched by title", dropped, moved)
     if not proposed:
         raise LLMUnavailable("the model returned no valid picks")
     by_id = {r.tmdb_id: r for r in pool}

@@ -31,8 +31,9 @@ class FakeLLM:
 
     def _default(self, name: str, system: str, user: str) -> dict[str, Any]:
         if name == "rerank":
-            ids = [int(i) for i in re.findall(r'"tmdb_id": (\d+)', user)]
-            return {"picks": [{"tmdb_id": t, "why": f"Because of film {t}."} for t in reversed(ids)]}
+            cands = [json.loads(line) for line in user.splitlines() if line.startswith('{"n": ')]
+            return {"picks": [{"n": c["n"], "title": c["title"], "why": f"Because of {c['title']}."}
+                              for c in reversed(cands)]}
         return dict(self.request_answer)
 
     def complete_json(self, system: str, user: str, name: str, schema: dict[str, Any]) -> LLMResult:
