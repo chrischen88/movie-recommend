@@ -98,6 +98,17 @@ async def basic_auth(request: Request, call_next: Callable[[Request], Awaitable[
     return await call_next(request)
 
 
+@app.middleware("http")
+async def no_store_api(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+    """API answers depend on the X-Session-Id header, which HTTP caches ignore,
+    and some (410 Gone) are cacheable by default: a browser that once got a 410
+    for /api/session kept replaying it for every later session. Never cache them."""
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 DbDep = Annotated[Session, Depends(get_session)]
 PipelineDep = Annotated[Pipeline, Depends(get_pipeline)]
 StoreDep = Annotated[SessionStore, Depends(get_session_store)]

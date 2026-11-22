@@ -298,7 +298,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   const id = sessionId();
   if (id) headers.set("X-Session-Id", id);
-  const resp = await fetch(path, { ...init, headers });
+  // no-store: answers depend on the X-Session-Id header, which the HTTP cache
+  // ignores. Also skips 410s that browsers cached before the server said no-store.
+  const resp = await fetch(path, { ...init, headers, cache: "no-store" });
   if (resp.status === 410) {
     setSessionId(null);
     sessionEnded = true;

@@ -527,3 +527,10 @@ def test_natural_language_request(client: TestClient, sample_zip: bytes) -> None
     # A filter set in the UI wins over the request's.
     body = client.get("/api/recommendations", params={"q": "something quiet", "genre": "Comedy"}).json()
     assert all("Comedy" in r["genres"] for r in body["items"])
+
+
+def test_api_responses_are_never_cached(client: TestClient) -> None:
+    # A cached 410 for /api/session (same URL for every session) broke new sessions.
+    assert client.get("/api/session").status_code == 410
+    assert client.get("/api/session").headers["cache-control"] == "no-store"
+    assert client.get("/api/health").headers["cache-control"] == "no-store"
